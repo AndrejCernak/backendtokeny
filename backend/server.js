@@ -57,6 +57,8 @@ wss.on("connection", (ws, req) => {
 
       // Klient zavolá adminovi
       if (data.type === "call-request") {
+        console.log(`📞 Call request from ${currentUserId} to ${targetId}`);
+  console.log("Current clients map:", [...clients.keys()]);
         const { targetId, callerName } = data;
         const target = clients.get(targetId);
         if (target) {
@@ -66,8 +68,11 @@ wss.on("connection", (ws, req) => {
               type: "incoming-call",
               from: currentUserId,
               callerName
+              
             }));
+            
           }
+          
 
           // Poslať FCM notifikáciu
           if (target.fcmToken) {
