@@ -2,10 +2,32 @@ require("dotenv").config();
 const express = require("express");
 const WebSocket = require("ws");
 const http = require("http");
+const cors = require("cors");
 const admin = require("./firebase-admin");
 
 const app = express();
 app.use(express.json());
+
+// ✅ Povolené originy pre CORS
+const allowedOrigins = [
+  "https://frontendtokeny.vercel.app", // hlavná Vercel URL
+  "https://frontendtokeny-42hveafvm-andrejcernaks-projects.vercel.app", // preview URL
+  "http://localhost:3000" // lokálny vývoj
+];
+
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type"],
+  })
+);
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
@@ -36,7 +58,7 @@ app.post("/register-fcm", (req, res) => {
 /**
  * WebSocket spojenie
  */
-wss.on("connection", (ws, req) => {
+wss.on("connection", (ws) => {
   let currentUserId = null;
 
   ws.on("message", async (message) => {
@@ -57,22 +79,21 @@ wss.on("connection", (ws, req) => {
 
       // Klient zavolá adminovi
       if (data.type === "call-request") {
-        console.log(`📞 Call request from ${currentUserId} to ${targetId}`);
-  console.log("Current clients map:", [...clients.keys()]);
         const { targetId, callerName } = data;
+        console.log(`📞 Call request from ${currentUserId} to ${targetId}`);
+        console.log("Current clients map:", [...clients.keys()]);
         const target = clients.get(targetId);
         if (target) {
           // Poslať WS event adminovi (ak je online)
           if (target.ws && target.ws.readyState === WebSocket.OPEN) {
-            target.ws.send(JSON.stringify({
-              type: "incoming-call",
-              from: currentUserId,
-              callerName
-              
-            }));
-            
+            target.ws.send(
+              JSON.stringify({
+                type: "incoming-call",
+                from: currentUserId,
+                callerName,
+              })
+            );
           }
-          
 
           // Poslať FCM notifikáciu
           if (target.fcmToken) {
@@ -85,8 +106,8 @@ wss.on("connection", (ws, req) => {
               data: {
                 type: "incoming_call",
                 from: currentUserId,
-                callerName
-              }
+                callerName,
+              },
             });
             console.log(`📩 Push notification sent to ${targetId}`);
           }
@@ -94,9 +115,17 @@ wss.on("connection", (ws, req) => {
       }
 
       // WebRTC forwardovanie správ
-      if (["webrtc-offer", "webrtc-answer", "webrtc-candidate"].includes(data.type)) {
+      if (
+        ["webrtc-offer", "webrtc-answer", "webrtc-candidate"].includes(
+          data.type
+        )
+      ) {
         const target = clients.get(data.targetId);
-        if (target && target.ws && target.ws.readyState === WebSocket.OPEN) {
+        if (
+          target &&
+          target.ws &&
+          target.ws.readyState === WebSocket.OPEN
+        ) {
           target.ws.send(JSON.stringify(data));
         }
       }
