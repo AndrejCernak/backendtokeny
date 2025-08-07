@@ -89,10 +89,11 @@ wss.on("connection", (ws) => {
             target.ws.send(
               JSON.stringify({
                 type: "incoming-call",
-                from: currentUserId,
+                callerId: currentUserId, // ✅ zmena tu
                 callerName,
               })
             );
+
           }
 
           // Poslať FCM notifikáciu
