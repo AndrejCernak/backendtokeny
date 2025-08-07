@@ -105,7 +105,7 @@ wss.on("connection", (ws) => {
               },
               data: {
                 type: "incoming_call",
-                from: currentUserId,
+                callerId: currentUserId, // 👈 zmena tu
                 callerName,
               },
             });
