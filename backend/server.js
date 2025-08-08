@@ -116,11 +116,9 @@ wss.on("connection", (ws) => {
       }
 
       // WebRTC forwardovanie správ
-      if (
-        ["webrtc-offer", "webrtc-answer", "webrtc-candidate"].includes(
-          data.type
-        )
-      ) {
+      if (["webrtc-offer", "webrtc-answer", "webrtc-candidate"].includes(data.type)) {
+  console.log(`🔁 Forwarding ${data.type} from ${currentUserId} to ${data.targetId}`);
+
         const target = clients.get(data.targetId);
         if (
           target &&
