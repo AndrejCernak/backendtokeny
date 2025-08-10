@@ -1,0 +1,96 @@
+// prisma/schema.prisma
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+/**
+ * Používateľ – ID môže byť rovno Clerk userId (napr. "user_abc...").
+ * Ak používate vlastný systém, stačí ID uložiť sem.
+ */
+model User {
+  id            String         @id
+  createdAt     DateTime       @default(now())
+
+  tokenBalance  TokenBalance?
+  transactions  Transaction[]
+  callSessionsAsCaller CallSession[] @relation("CallerSessions")
+  callSessionsAsCallee CallSession[] @relation("CalleeSessions")
+}
+
+/**
+ * Zostatok tokenov v sekundách (centrálny zdroj pravdy pre „môžem/nesmiem volať“).
+ */
+model TokenBalance {
+  userId           String   @id
+  secondsRemaining Int      @default(0)
+  updatedAt        DateTime @updatedAt
+
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+/**
+ * Finančno-kreditné pohyby:
+ * - purchase     (+seconds, +amount)
+ * - call_debit   (-seconds, amount 0 – cenu si počítame na konci hovoru / sumárne)
+ * - adjustment   ručné korekcie (+/- seconds)
+ * - refund       vrátenie kreditu (záporný amount, kladne seconds)
+ */
+model Transaction {
+  id           String           @id @default(cuid())
+  userId       String
+  type         TransactionType
+  amountEur    Decimal          @db.Decimal(10, 2) @default(0) // sumár v €
+  secondsDelta Int              @default(0)                      // + pri nákupe, - pri debite
+  note         String?
+  createdAt    DateTime         @default(now())
+
+  user         User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([type, createdAt])
+}
+
+enum TransactionType {
+  purchase
+  call_debit
+  adjustment
+  refund
+}
+
+/**
+ * Log hovorov – prehľad, koľko sa reálne minulo a za koľko €.
+ * secondsBilled a priceEur si vieš dopočítať pri ukončení hovoru.
+ */
+model CallSession {
+  id            String      @id @default(cuid())
+  // ❗ urobíme ich voliteľné, aby SetNull dával zmysel
+  callerId      String?     
+  calleeId      String?
+  startedAt     DateTime    @default(now())
+  endedAt       DateTime?
+  status        CallStatus  @default(active)
+
+  secondsBilled Int         @default(0)
+  priceEur      Decimal     @db.Decimal(10, 2) @default(0)
+
+  // vzťahy môžu zostať s onDelete: SetNull
+  caller        User?       @relation("CallerSessions", fields: [callerId], references: [id], onDelete: SetNull)
+  callee        User?       @relation("CalleeSessions", fields: [calleeId], references: [id], onDelete: SetNull)
+
+  @@index([callerId, startedAt])
+  @@index([calleeId, startedAt])
+  @@index([status, startedAt])
+}
+
+
+enum CallStatus {
+  active
+  ended
+  aborted
+  no_tokens
+}
