@@ -11,21 +11,18 @@ const prisma = new PrismaClient();
 const app = express();
 app.use(express.json());
 
-// ✅ Povolené originy pre CORS
+// ✅ CORS – doplň svoje produkčné domény podľa potreby
 const allowedOrigins = [
-  "https://frontendtokeny.vercel.app", // hlavná Vercel URL
-  "https://frontendtokeny-42hveafvm-andrejcernaks-projects.vercel.app", // preview URL
-  "http://localhost:3000", // lokálny vývoj
+  "https://frontendtokeny.vercel.app",
+  "https://frontendtokeny-42hveafvm-andrejcernaks-projects.vercel.app",
+  "http://localhost:3000",
 ];
 
 app.use(
   cors({
-    origin: function (origin, callback) {
-      if (!origin || allowedOrigins.includes(origin)) {
-        callback(null, true);
-      } else {
-        callback(new Error("Not allowed by CORS"));
-      }
+    origin: (origin, cb) => {
+      if (!origin || allowedOrigins.includes(origin)) cb(null, true);
+      else cb(new Error("Not allowed by CORS"));
     },
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type"],
@@ -35,38 +32,28 @@ app.use(
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-/**
- * Uložíme pripojených užívateľov:
- * Map<userId, { ws: WebSocket|null, fcmToken?: string, role?: 'client'|'admin' }>
- */
+/** Map<userId, { ws: WebSocket|null, fcmToken?: string, role?: 'client'|'admin' }> */
 const clients = new Map();
 
-/**
- * Pending prichádzajúce hovory: keď app nie je otvorená, WS nebeží.
- * Pošleme "incoming-call" hneď po REGISTER, ak je tu čerstvý záznam.
- * Map<targetId, { callerId: string, callerName: string, ts: number }>
- */
+/** Pending prichádzajúce hovory. Map<targetId, { callerId, callerName, ts }> */
 const pendingCalls = new Map();
-const PENDING_TTL_MS = 90 * 1000; // držíme 90 sekúnd
+const PENDING_TTL_MS = 90 * 1000;
 
-/**
- * Aktívne hovory a účtovanie
+/** Aktívne hovory a účtovanie.
  * Map<callKey, { callerId, calleeId, intervalId, startedAt, callSessionId }>
  */
 const activeCalls = new Map();
-function callKeyFor(a, b) {
-  return [a, b].sort().join("__");
-}
+const callKeyFor = (a, b) => [a, b].sort().join("__");
 
 // Billing: 450 €/h -> 0.125 €/s
 const PRICE_PER_SECOND = 0.125;
 
-// ===== Helpers: DB (Tokeny) =====
-async function ensureUser(userId) {
+/* ===== Helpers: DB (Tokeny) ===== */
+async function ensureUser(userId, role = "client") {
   await prisma.user.upsert({
     where: { id: userId },
-    update: {},
-    create: { id: userId },
+    update: { role },
+    create: { id: userId, role },
   });
 }
 
@@ -109,7 +96,7 @@ function secondsForAmount(amountEur) {
   return Math.floor(Number(amountEur) / PRICE_PER_SECOND);
 }
 
-// ===== REST: balance & purchase (MVP) =====
+/* ===== REST: balance, purchase, me ===== */
 app.get("/balance/:userId", async (req, res) => {
   try {
     const { userId } = req.params;
@@ -127,9 +114,8 @@ app.post("/purchase", async (req, res) => {
     const { userId, amountEur } = req.body || {};
     if (!userId || !amountEur) return res.status(400).json({ error: "Missing userId or amountEur" });
 
-    await ensureUser(userId);
     const seconds = secondsForAmount(amountEur);
-
+    await ensureUser(userId, "client");
     await incrementSeconds(userId, seconds);
     await prisma.transaction.create({
       data: { userId, type: "purchase", amountEur: Number(amountEur), secondsDelta: seconds, note: "purchase_mvp" },
@@ -143,9 +129,24 @@ app.post("/purchase", async (req, res) => {
   }
 });
 
-/** 
- * API endpoint na registráciu FCM tokenu po prihlásení 
- */
+app.get("/me/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    if (!userId) return res.status(400).json({ error: "Missing userId" });
+
+    const user = await prisma.user.findUnique({ where: { id: userId } });
+    const role = user?.role || "client";
+    const tb = await prisma.tokenBalance.findUnique({ where: { userId } });
+    const secondsRemaining = tb?.secondsRemaining ?? 0;
+
+    return res.json({ userId, role, secondsRemaining });
+  } catch (e) {
+    console.error("/me error:", e);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+/** Registrácia FCM tokenu + uloženie role */
 app.post("/register-fcm", (req, res) => {
   const { userId, fcmToken, role } = req.body || {};
   if (!userId || !fcmToken) {
@@ -160,14 +161,23 @@ app.post("/register-fcm", (req, res) => {
     if (role) entry.role = role;
   }
 
+  // persist role (idempotentne)
+  (async () => {
+    try {
+      const dbRole = role === "admin" ? "admin" : "client";
+      await ensureUser(userId, dbRole);
+    } catch (e) {
+      console.error("upsert user role error:", e);
+    }
+  })();
+
   return res.json({ success: true });
 });
 
-// ===== WebSocket spojenie =====
+/* ===== WebSocket spojenie ===== */
 wss.on("connection", (ws) => {
   let currentUserId = null;
 
-  // keepalive
   ws.isAlive = true;
   ws.on("pong", () => (ws.isAlive = true));
 
@@ -175,33 +185,32 @@ wss.on("connection", (ws) => {
     try {
       const data = JSON.parse(message);
 
-      // Registrácia užívateľa na WS
+      // REGISTER
       if (data.type === "register") {
         currentUserId = data.userId;
         if (!currentUserId) return;
 
-        const role = data.role || (clients.get(currentUserId)?.role ?? undefined);
+        const role = data.role === "admin" ? "admin" : "client";
+        await ensureUser(currentUserId, role);
 
         if (!clients.has(currentUserId)) {
           clients.set(currentUserId, { ws, role });
         } else {
           const entry = clients.get(currentUserId);
           entry.ws = ws;
-          if (role) entry.role = role;
+          entry.role = role;
         }
-        console.log(`✅ ${currentUserId} (${role || "unknown"}) connected via WS`);
+        console.log(`✅ ${currentUserId} (${role}) connected via WS`);
 
-        // Ak má tento user pending prichádzajúci hovor, hneď mu ho odošli
+        // pending incoming-call po opätovnom pripojení
         const pending = pendingCalls.get(currentUserId);
         if (pending && Date.now() - pending.ts <= PENDING_TTL_MS) {
           try {
-            ws.send(
-              JSON.stringify({
-                type: "incoming-call",
-                callerId: pending.callerId,
-                callerName: pending.callerName,
-              })
-            );
+            ws.send(JSON.stringify({
+              type: "incoming-call",
+              callerId: pending.callerId,
+              callerName: pending.callerName,
+            }));
             pendingCalls.delete(currentUserId);
           } catch (e) {
             console.error("❌ Failed to deliver pending incoming-call:", e);
@@ -209,60 +218,47 @@ wss.on("connection", (ws) => {
         }
       }
 
-      // Klient zavolá adminovi
+      // CALL REQUEST
       if (data.type === "call-request") {
         const { targetId, callerName } = data;
         if (!currentUserId || !targetId) return;
 
-        // ❗ over zostatok volajúceho
-        const seconds = await getSeconds(currentUserId);
-        if (seconds <= 0) {
-          const caller = clients.get(currentUserId);
-          if (caller?.ws?.readyState === WebSocket.OPEN) {
-            caller.ws.send(JSON.stringify({ type: "insufficient-tokens" }));
+        const callerEntry = clients.get(currentUserId);
+        const callerRole = callerEntry?.role || "client";
+
+        // len klient musí mať kredit
+        if (callerRole !== "admin") {
+          const seconds = await getSeconds(currentUserId);
+          if (seconds <= 0) {
+            if (callerEntry?.ws?.readyState === WebSocket.OPEN) {
+              callerEntry.ws.send(JSON.stringify({ type: "insufficient-tokens" }));
+            }
+            return;
           }
-          return;
         }
 
         console.log(`📞 Call request from ${currentUserId} to ${targetId}`);
         const target = clients.get(targetId);
 
-        // Ulož pending call (aj keby cieľ nebol online)
-        pendingCalls.set(targetId, {
-          callerId: currentUserId,
-          callerName,
-          ts: Date.now(),
-        });
+        // pending (aj keď cieľ nie je online)
+        pendingCalls.set(targetId, { callerId: currentUserId, callerName, ts: Date.now() });
 
-        // Poslať WS event adminovi (ak je online)
-        if (target && target.ws && target.ws.readyState === WebSocket.OPEN) {
+        // WS adminovi
+        if (target?.ws?.readyState === WebSocket.OPEN) {
           try {
-            target.ws.send(
-              JSON.stringify({
-                type: "incoming-call",
-                callerId: currentUserId,
-                callerName,
-              })
-            );
+            target.ws.send(JSON.stringify({ type: "incoming-call", callerId: currentUserId, callerName }));
           } catch (e) {
             console.error("❌ WS send incoming-call error:", e);
           }
         }
 
-        // Poslať FCM notifikáciu (ak máme token)
+        // FCM push
         if (target?.fcmToken) {
           try {
             await admin.messaging().send({
               token: target.fcmToken,
-              notification: {
-                title: "Prichádzajúci hovor",
-                body: `${callerName} ti volá`,
-              },
-              data: {
-                type: "incoming_call",
-                callerId: currentUserId,
-                callerName: callerName || "",
-              },
+              notification: { title: "Prichádzajúci hovor", body: `${callerName} ti volá` },
+              data: { type: "incoming_call", callerId: currentUserId, callerName: callerName || "" },
             });
             console.log(`📩 Push notification sent to ${targetId}`);
           } catch (e) {
@@ -271,85 +267,69 @@ wss.on("connection", (ws) => {
         }
       }
 
-      // WebRTC forwardovanie správ (pridávame aj 'from')
+      // WebRTC forward (pridáme 'from')
       if (["webrtc-offer", "webrtc-answer", "webrtc-candidate"].includes(data.type)) {
         if (!currentUserId || !data.targetId) return;
 
-        console.log(`🔁 Forwarding ${data.type} from ${currentUserId} to ${data.targetId}`);
         const target = clients.get(data.targetId);
-
-        if (target && target.ws && target.ws.readyState === WebSocket.OPEN) {
+        if (target?.ws?.readyState === WebSocket.OPEN) {
           try {
-            const payload = { ...data, from: currentUserId };
-            target.ws.send(JSON.stringify(payload));
+            target.ws.send(JSON.stringify({ ...data, from: currentUserId }));
           } catch (e) {
             console.error(`❌ WS forward ${data.type} error:`, e);
           }
         }
 
-        // 🔔 Keď admin pošle ANSWER volajúcemu, spustíme billing
+        // Spustenie billing-u pri ANSWER (admin -> volajúci)
         if (data.type === "webrtc-answer") {
-          const callerId = data.targetId; // komu answer posielame
-          const calleeId = currentUserId; // kto answer poslal (admin)
+          const callerId = data.targetId;     // komu posielame answer
+          const calleeId = currentUserId;     // kto poslal answer (admin)
 
-          // založ CallSession (ak ešte neexistuje)
           const key = callKeyFor(callerId, calleeId);
           if (!activeCalls.has(key)) {
             try {
-              await ensureUser(callerId);
-              await ensureUser(calleeId);
+              const callerRole = clients.get(callerId)?.role || "client";
+              await ensureUser(callerId, callerRole);
+              await ensureUser(calleeId, "admin");
 
               const session = await prisma.callSession.create({
-                data: {
-                  callerId,
-                  calleeId,
-                  status: "active",
-                  startedAt: new Date(),
-                },
+                data: { callerId, calleeId, status: "active", startedAt: new Date() },
               });
 
-              // každých 10 s odpočítaj 10 s volajúcemu
+              const billCaller = callerRole !== "admin"; // admin sa neúčtuje
+
               const intervalId = setInterval(async () => {
                 try {
-                  const remaining = await decrementSeconds(callerId, 10);
+                  if (billCaller) {
+                    const remaining = await decrementSeconds(callerId, 10);
 
-                  // voliteľné: posielaj live balance-update
-                  const caller = clients.get(callerId);
-                  if (caller?.ws?.readyState === WebSocket.OPEN) {
-                    caller.ws.send(
-                      JSON.stringify({
-                        type: "balance-update",
-                        secondsRemaining: remaining,
-                      })
-                    );
-                  }
+                    // live update klientovi
+                    const caller = clients.get(callerId);
+                    if (caller?.ws?.readyState === WebSocket.OPEN) {
+                      caller.ws.send(JSON.stringify({ type: "balance-update", secondsRemaining: remaining }));
+                    }
 
-                  if (remaining <= 0) {
-                    // došlo – ukonči hovor
-                    const msg = JSON.stringify({ type: "end-call", reason: "no-tokens" });
-                    const callee = clients.get(calleeId);
-                    try { caller?.ws?.readyState === WebSocket.OPEN && caller.ws.send(msg); } catch {}
-                    try { callee?.ws?.readyState === WebSocket.OPEN && callee.ws.send(msg); } catch {}
+                    if (remaining <= 0) {
+                      const msg = JSON.stringify({ type: "end-call", reason: "no-tokens" });
+                      const callee = clients.get(calleeId);
+                      const callerWs = clients.get(callerId)?.ws;
+                      try { callerWs?.readyState === WebSocket.OPEN && callerWs.send(msg); } catch {}
+                      try { callee?.ws?.readyState === WebSocket.OPEN && callee.ws.send(msg); } catch {}
 
-                    // ukonči session
-                    const endedAt = new Date();
-                    const secondsBilled = Math.ceil((endedAt - session.startedAt) / 1000);
-                    const priceEur = (secondsBilled * PRICE_PER_SECOND).toFixed(2);
-                    await prisma.callSession.update({
-                      where: { id: session.id },
-                      data: {
-                        endedAt,
-                        status: "no_tokens",
-                        secondsBilled,
-                        priceEur,
-                      },
-                    });
+                      const endedAt = new Date();
+                      const secondsBilled = Math.ceil((endedAt - session.startedAt) / 1000);
+                      const priceEur = Math.round(secondsBilled * PRICE_PER_SECOND * 100) / 100;
+                      await prisma.callSession.update({
+                        where: { id: session.id },
+                        data: { endedAt, status: "no_tokens", secondsBilled, priceEur },
+                      });
 
-                    clearInterval(intervalId);
-                    activeCalls.delete(key);
+                      clearInterval(intervalId);
+                      activeCalls.delete(key);
+                    }
                   }
                 } catch (e) {
-                  console.error("decrement/billing interval error:", e);
+                  console.error("billing interval error:", e);
                 }
               }, 10_000);
 
@@ -361,7 +341,7 @@ wss.on("connection", (ws) => {
                 callSessionId: session.id,
               });
 
-              // pošli volajúcemu info, že hovor naozaj začal
+              // potvrdenie volajúcemu
               const callerEntry = clients.get(callerId);
               if (callerEntry?.ws?.readyState === WebSocket.OPEN) {
                 callerEntry.ws.send(JSON.stringify({ type: "call-started", from: calleeId }));
@@ -373,18 +353,15 @@ wss.on("connection", (ws) => {
         }
       }
 
-      // Ukončenie hovoru (manuálne)
+      // Manuálne ukončenie
       if (data.type === "end-call") {
         const target = clients.get(data.targetId);
         if (target?.ws?.readyState === WebSocket.OPEN) {
-          try {
-            target.ws.send(JSON.stringify({ type: "end-call", from: currentUserId }));
-          } catch (e) {
+          try { target.ws.send(JSON.stringify({ type: "end-call", from: currentUserId })); } catch (e) {
             console.error("❌ WS end-call forward error:", e);
           }
         }
 
-        // zastav meter pre túto dvojicu a ulož CallSession
         const key = callKeyFor(currentUserId, data.targetId);
         const c = activeCalls.get(key);
         if (c) {
@@ -393,15 +370,10 @@ wss.on("connection", (ws) => {
           try {
             const endedAt = new Date();
             const secondsBilled = Math.ceil((endedAt - c.startedAt) / 1000);
-            const priceEur = (secondsBilled * PRICE_PER_SECOND).toFixed(2);
+            const priceEur = Math.round(secondsBilled * PRICE_PER_SECOND * 100) / 100;
             await prisma.callSession.update({
               where: { id: c.callSessionId },
-              data: {
-                endedAt,
-                status: "ended",
-                secondsBilled,
-                priceEur,
-              },
+              data: { endedAt, status: "ended", secondsBilled, priceEur },
             });
           } catch (e) {
             console.error("finish callSession error:", e);
@@ -414,26 +386,20 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
-    // ak ktokoľvek z dvojice spadne, stopni meter
     if (currentUserId) {
+      // stopni meter ak user spadne
       for (const [key, c] of activeCalls.entries()) {
         if (c.callerId === currentUserId || c.calleeId === currentUserId) {
           clearInterval(c.intervalId);
           activeCalls.delete(key);
-          // ukončiť aj CallSession ako 'aborted'
           (async () => {
             try {
               const endedAt = new Date();
               const secondsBilled = Math.ceil((endedAt - c.startedAt) / 1000);
-              const priceEur = (secondsBilled * PRICE_PER_SECOND).toFixed(2);
+              const priceEur = Math.round(secondsBilled * PRICE_PER_SECOND * 100) / 100;
               await prisma.callSession.update({
                 where: { id: c.callSessionId },
-                data: {
-                  endedAt,
-                  status: "aborted",
-                  secondsBilled,
-                  priceEur,
-                },
+                data: { endedAt, status: "aborted", secondsBilled, priceEur },
               });
             } catch (e) {
               console.error("abort callSession error:", e);
@@ -445,42 +411,28 @@ wss.on("connection", (ws) => {
 
     if (currentUserId && clients.has(currentUserId)) {
       const entry = clients.get(currentUserId);
-      if (entry) entry.ws = null; // necháme fcmToken/role, user sa môže vrátiť
+      if (entry) entry.ws = null;
       console.log(`🔌 ${currentUserId} disconnected`);
     }
   });
 
-  ws.on("error", (e) => {
-    console.error("❌ WS error:", e?.message || e);
-  });
+  ws.on("error", (e) => console.error("❌ WS error:", e?.message || e));
 });
 
-// WS keepalive (pomôže na niektorých hostoch)
+// WS keepalive
 const interval = setInterval(() => {
   wss.clients.forEach((ws) => {
     if (ws.isAlive === false) return ws.terminate();
     ws.isAlive = false;
-    try {
-      ws.ping(() => {});
-    } catch {}
+    try { ws.ping(() => {}); } catch {}
   });
 }, 30000);
 
-wss.on("close", () => {
-  clearInterval(interval);
-});
+wss.on("close", () => clearInterval(interval));
 
-// Graceful shutdown Prisma
-process.on("SIGINT", async () => {
-  await prisma.$disconnect();
-  process.exit(0);
-});
-process.on("SIGTERM", async () => {
-  await prisma.$disconnect();
-  process.exit(0);
-});
+// Graceful shutdown
+process.on("SIGINT", async () => { await prisma.$disconnect(); process.exit(0); });
+process.on("SIGTERM", async () => { await prisma.$disconnect(); process.exit(0); });
 
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => {
-  console.log(`🚀 Backend running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`🚀 Backend running on port ${PORT}`));

@@ -8,6 +8,11 @@ generator client {
   provider = "prisma-client-js"
 }
 
+enum UserRole {
+  client
+  admin
+}
+
 /**
  * Používateľ – ID môže byť rovno Clerk userId (napr. "user_abc...").
  * Ak používate vlastný systém, stačí ID uložiť sem.
@@ -15,6 +20,8 @@ generator client {
 model User {
   id            String         @id
   createdAt     DateTime       @default(now())
+  role          UserRole       @default(client)   // 👈 pridané
+
 
   tokenBalance  TokenBalance?
   transactions  Transaction[]
