@@ -1,4 +1,4 @@
-// prisma/schema.prisma
+// ===== Datasource & Generator =====
 datasource db {
   provider = "mysql"
   url      = env("DATABASE_URL")
@@ -8,22 +8,25 @@ generator client {
   provider = "prisma-client-js"
 }
 
-/**
- * Používateľ – ID môže byť rovno Clerk userId (napr. "user_abc...").
- * Ak používate vlastný systém, stačí ID uložiť sem.
- */
+// ===== User & Legacy Credit (seconds) =====
 model User {
-  id            String         @id
-  createdAt     DateTime       @default(now())
+  id                   String         @id
+  createdAt            DateTime       @default(now())
 
-  tokenBalance  TokenBalance?
-  transactions  Transaction[]
-  callSessionsAsCaller CallSession[] @relation("CallerSessions")
-  callSessionsAsCallee CallSession[] @relation("CalleeSessions")
+  tokenBalance         TokenBalance?
+  transactions         Transaction[]
+  callSessionsAsCaller CallSession[]  @relation("CallerSessions")
+  callSessionsAsCallee CallSession[]  @relation("CalleeSessions")
+
+  // spätné pole k FridayToken.owner
+  fridayTokens         FridayToken[]  @relation("UserFridayTokens")
+
+  // spätné pole k FridayListing.seller
+  tokenListings        FridayListing[] @relation("SellerListings")
 }
 
 /**
- * Zostatok tokenov v sekundách (centrálny zdroj pravdy pre „môžem/nesmiem volať“).
+ * Bežný kredit (mimo piatku) v sekundách (zostáva kvôli starej logike)
  */
 model TokenBalance {
   userId           String   @id
@@ -34,18 +37,16 @@ model TokenBalance {
 }
 
 /**
- * Finančno-kreditné pohyby:
- * - purchase     (+seconds, +amount)
- * - call_debit   (-seconds, amount 0 – cenu si počítame na konci hovoru / sumárne)
- * - adjustment   ručné korekcie (+/- seconds)
- * - refund       vrátenie kreditu (záporný amount, kladne seconds)
+ * Finančno-kreditné pohyby.
+ * secondsDelta používame pre „bežný kredit“ (mimo piatku).
+ * Piatkové nákupy/obchody evidujeme cez Friday* typy.
  */
 model Transaction {
   id           String           @id @default(cuid())
   userId       String
   type         TransactionType
-  amountEur    Decimal          @db.Decimal(10, 2) @default(0) // sumár v €
-  secondsDelta Int              @default(0)                      // + pri nákupe, - pri debite
+  amountEur    Decimal          @db.Decimal(10, 2) @default(0)
+  secondsDelta Int              @default(0)
   note         String?
   createdAt    DateTime         @default(now())
 
@@ -56,20 +57,25 @@ model Transaction {
 }
 
 enum TransactionType {
+  // legacy / mimo piatku
   purchase
   call_debit
   adjustment
   refund
+
+  // piatkové tokeny
+  friday_purchase
+  friday_trade_buy
+  friday_trade_sell
 }
 
 /**
- * Log hovorov – prehľad, koľko sa reálne minulo a za koľko €.
- * secondsBilled a priceEur si vieš dopočítať pri ukončení hovoru.
+ * Log hovorov (spoločný pre oba režimy).
+ * secondsBilled/priceEur môže byť pri piatku len informatívny.
  */
 model CallSession {
   id            String      @id @default(cuid())
-  // ❗ urobíme ich voliteľné, aby SetNull dával zmysel
-  callerId      String?     
+  callerId      String?
   calleeId      String?
   startedAt     DateTime    @default(now())
   endedAt       DateTime?
@@ -78,7 +84,6 @@ model CallSession {
   secondsBilled Int         @default(0)
   priceEur      Decimal     @db.Decimal(10, 2) @default(0)
 
-  // vzťahy môžu zostať s onDelete: SetNull
   caller        User?       @relation("CallerSessions", fields: [callerId], references: [id], onDelete: SetNull)
   callee        User?       @relation("CalleeSessions", fields: [calleeId], references: [id], onDelete: SetNull)
 
@@ -87,10 +92,78 @@ model CallSession {
   @@index([status, startedAt])
 }
 
-
 enum CallStatus {
   active
   ended
   aborted
   no_tokens
+}
+
+// ===== Friday Tokens (Alternatíva A) =====
+
+/**
+ * Jeden piatkový token = 60 min. Prenositeľný (burza).
+ */
+model FridayToken {
+  id               String             @id @default(cuid())
+  ownerId          String?
+  issuedYear       Int
+  minutesRemaining Int                @default(60)
+  status           FridayTokenStatus  @default(active)
+  createdAt        DateTime           @default(now())
+  originalPriceEur Decimal            @db.Decimal(10, 2)
+
+  // väzba na User (pomenovaná relácia + spätné pole v User.fridayTokens)
+  owner            User?              @relation("UserFridayTokens", fields: [ownerId], references: [id], onDelete: SetNull)
+
+  // spätné pole k FridayListing.token (1:1, tokenId je unique)
+  listing          FridayListing?     @relation("TokenListing")
+
+  @@index([ownerId])
+  @@index([issuedYear])
+  @@index([status])
+}
+
+enum FridayTokenStatus {
+  active
+  spent
+  listed
+}
+
+/**
+ * Evidencia emisie v danom roku (treasury).
+ */
+model FridaySupply {
+  year        Int      @id
+  totalMinted Int
+  totalSold   Int      @default(0)
+  priceEur    Decimal  @db.Decimal(10, 2)
+  createdAt   DateTime @default(now())
+}
+
+/**
+ * Sekundárny trh – listing jedného konkrétneho tokenu.
+ */
+model FridayListing {
+  id        String        @id @default(cuid())
+  tokenId   String        @unique
+  sellerId  String
+  priceEur  Decimal       @db.Decimal(10, 2)
+  status    ListingStatus @default(open)
+  createdAt DateTime      @default(now())
+  closedAt  DateTime?
+
+  // relácia na token + spätné pole vo FridayToken.listing
+  token     FridayToken   @relation("TokenListing", fields: [tokenId], references: [id], onDelete: Cascade)
+
+  // relácia na seller + spätné pole v User.tokenListings
+  seller    User          @relation("SellerListings", fields: [sellerId], references: [id], onDelete: Cascade)
+
+  @@index([status, createdAt])
+}
+
+enum ListingStatus {
+  open
+  sold
+  cancelled
 }

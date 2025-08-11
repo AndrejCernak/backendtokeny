@@ -6,8 +6,12 @@ const cors = require("cors");
 const admin = require("./firebase-admin");
 const { PrismaClient } = require("@prisma/client");
 
-const prisma = new PrismaClient();
+// Friday modules
+const fridayRoutes = require("./friday/routes");
+const { isFridayInBratislava } = require("./friday/config");
+const { fridayMinutes, consumeFridaySeconds } = require("./friday/db");
 
+const prisma = new PrismaClient();
 const app = express();
 app.use(express.json());
 
@@ -28,28 +32,24 @@ app.use(
       }
     },
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
-// 1 token = 60 min
+// 1 token (starý kredit) = 60 min
 const TOKEN_MINUTES = 60;
 const SECONDS_PER_TOKEN = TOKEN_MINUTES * 60;
 
-// Cenník balíkov – drž na backende ako zdroj pravdy
+// Cenník balíkov – zachované pre „bežný kredit“ mimo piatkov (môžeš neskôr zrušiť)
 function priceForTokens(tokens) {
-  // podľa tvojej burzy: 1,3,5,10
   switch (tokens) {
-    case 1:  return 450;
-    case 3:  return 1280; // ~ -5%
-    case 5:  return 2070; // ~ -8%
-    case 10: return 3960; // ~ -12%
-    default:
-      // ak chceš povoliť ľubovoľné množstvo, môžeš hodiť linear: return tokens * 450;
-      throw new Error("Unsupported token pack");
+    case 1: return 450;
+    case 3: return 1280;
+    case 5: return 2070;
+    case 10: return 3960;
+    default: throw new Error("Unsupported token pack");
   }
 }
-
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
@@ -61,12 +61,11 @@ const wss = new WebSocket.Server({ server });
 const clients = new Map();
 
 /**
- * Pending prichádzajúce hovory: keď app nie je otvorená, WS nebeží.
- * Pošleme "incoming-call" hneď po REGISTER, ak je tu čerstvý záznam.
+ * Pending prichádzajúce hovory (ak app nie je otvorená).
  * Map<targetId, { callerId: string, callerName: string, ts: number }>
  */
 const pendingCalls = new Map();
-const PENDING_TTL_MS = 90 * 1000; // držíme 90 sekúnd
+const PENDING_TTL_MS = 90 * 1000;
 
 /**
  * Aktívne hovory a účtovanie
@@ -77,10 +76,10 @@ function callKeyFor(a, b) {
   return [a, b].sort().join("__");
 }
 
-// Billing: 450 €/h -> 0.125 €/s
+// Billing pre „bežný“ kredit: 450 €/h -> 0.125 €/s
 const PRICE_PER_SECOND = 0.125;
 
-// ===== Helpers: DB (Tokeny) =====
+// ===== Helpers: DB (bežný kredit v sekundách) =====
 async function ensureUser(userId) {
   await prisma.user.upsert({
     where: { id: userId },
@@ -128,7 +127,7 @@ function secondsForAmount(amountEur) {
   return Math.floor(Number(amountEur) / PRICE_PER_SECOND);
 }
 
-// ===== REST: balance & purchase (MVP) =====
+// ===== REST: balance & purchase (MVP bežného kreditu) =====
 app.get("/balance/:userId", async (req, res) => {
   try {
     const { userId } = req.params;
@@ -171,7 +170,6 @@ app.post("/purchase-tokens", async (req, res) => {
 
     await ensureUser(userId);
 
-    // cenu rátaj na serveri
     let amountEur = 0;
     try {
       amountEur = priceForTokens(tokens);
@@ -181,10 +179,8 @@ app.post("/purchase-tokens", async (req, res) => {
 
     const secondsToAdd = tokens * SECONDS_PER_TOKEN;
 
-    // navýš kredit
     await incrementSeconds(userId, secondsToAdd);
 
-    // zapíš transakciu (používam tvoju existujúcu tabuľku `transaction`)
     await prisma.transaction.create({
       data: {
         userId,
@@ -195,10 +191,8 @@ app.post("/purchase-tokens", async (req, res) => {
       },
     });
 
-    // zisti nový stav
     const secondsRemaining = await getSeconds(userId);
 
-    // (nice-to-have) pošli okamžitý WS update, ak je user online
     const entry = clients.get(userId);
     if (entry?.ws?.readyState === WebSocket.OPEN) {
       try {
@@ -219,7 +213,6 @@ app.post("/purchase-tokens", async (req, res) => {
   }
 });
 
-
 /** 
  * API endpoint na registráciu FCM tokenu po prihlásení 
  */
@@ -239,6 +232,12 @@ app.post("/register-fcm", (req, res) => {
 
   return res.json({ success: true });
 });
+
+/**
+ * ===== PIATOK: tokenová ekonomika a burza
+ * Mountneme /friday/* routy
+ */
+app.use("/", fridayRoutes(prisma));
 
 // ===== WebSocket spojenie =====
 wss.on("connection", (ws) => {
@@ -291,14 +290,25 @@ wss.on("connection", (ws) => {
         const { targetId, callerName } = data;
         if (!currentUserId || !targetId) return;
 
-        // ❗ over zostatok volajúceho
-        const seconds = await getSeconds(currentUserId);
-        if (seconds <= 0) {
-          const caller = clients.get(currentUserId);
-          if (caller?.ws?.readyState === WebSocket.OPEN) {
-            caller.ws.send(JSON.stringify({ type: "insufficient-tokens" }));
+        if (isFridayInBratislava()) {
+          const minutes = await fridayMinutes(currentUserId);
+          if (minutes <= 0) {
+            const caller = clients.get(currentUserId);
+            if (caller?.ws?.readyState === WebSocket.OPEN) {
+              caller.ws.send(JSON.stringify({ type: "insufficient-friday-tokens" }));
+            }
+            return;
           }
-          return;
+        } else {
+          // mimo piatku – buď povoľujeme bez limitu, alebo kontrola „bežného“ kreditu:
+          const seconds = await getSeconds(currentUserId);
+          if (seconds <= 0) {
+            const caller = clients.get(currentUserId);
+            if (caller?.ws?.readyState === WebSocket.OPEN) {
+              caller.ws.send(JSON.stringify({ type: "insufficient-tokens" }));
+            }
+            return;
+          }
         }
 
         console.log(`📞 Call request from ${currentUserId} to ${targetId}`);
@@ -385,45 +395,74 @@ wss.on("connection", (ws) => {
                 },
               });
 
-              // každých 10 s odpočítaj 10 s volajúcemu
+              // každých 10 s odpočítaj 10 s
               const intervalId = setInterval(async () => {
                 try {
-                  const remaining = await decrementSeconds(callerId, 10);
+                  if (isFridayInBratislava()) {
+                    // PIATOK → piatkové tokeny
+                    const deficit = await consumeFridaySeconds(callerId, 10);
+                    const minutesLeft = await fridayMinutes(callerId);
 
-                  // voliteľné: posielaj live balance-update
-                  const caller = clients.get(callerId);
-                  if (caller?.ws?.readyState === WebSocket.OPEN) {
-                    caller.ws.send(
-                      JSON.stringify({
-                        type: "balance-update",
-                        secondsRemaining: remaining,
-                      })
-                    );
-                  }
+                    // live update klientovi (minúty)
+                    const caller = clients.get(callerId);
+                    if (caller?.ws?.readyState === WebSocket.OPEN) {
+                      caller.ws.send(JSON.stringify({ type: "friday-balance-update", minutesRemaining: minutesLeft }));
+                    }
 
-                  if (remaining <= 0) {
-                    // došlo – ukonči hovor
-                    const msg = JSON.stringify({ type: "end-call", reason: "no-tokens" });
-                    const callee = clients.get(calleeId);
-                    try { caller?.ws?.readyState === WebSocket.OPEN && caller.ws.send(msg); } catch {}
-                    try { callee?.ws?.readyState === WebSocket.OPEN && callee.ws.send(msg); } catch {}
+                    if (deficit > 0 || minutesLeft <= 0) {
+                      // došli piatkové minúty – ukonči hovor
+                      const msg = JSON.stringify({ type: "end-call", reason: "no-friday-tokens" });
+                      const callee = clients.get(calleeId);
+                      try { caller?.ws?.readyState === WebSocket.OPEN && caller.ws.send(msg); } catch {}
+                      try { callee?.ws?.readyState === WebSocket.OPEN && callee.ws.send(msg); } catch {}
 
-                    // ukonči session
-                    const endedAt = new Date();
-                    const secondsBilled = Math.ceil((endedAt - session.startedAt) / 1000);
-                    const priceEur = (secondsBilled * PRICE_PER_SECOND).toFixed(2);
-                    await prisma.callSession.update({
-                      where: { id: session.id },
-                      data: {
-                        endedAt,
-                        status: "no_tokens",
-                        secondsBilled,
-                        priceEur,
-                      },
-                    });
+                      const endedAt = new Date();
+                      const secondsBilled = Math.ceil((endedAt - session.startedAt) / 1000);
+                      const priceEur = (secondsBilled * PRICE_PER_SECOND).toFixed(2); // len informatívne
+                      await prisma.callSession.update({
+                        where: { id: session.id },
+                        data: {
+                          endedAt,
+                          status: "no_tokens",
+                          secondsBilled,
+                          priceEur,
+                        },
+                      });
 
-                    clearInterval(intervalId);
-                    activeCalls.delete(key);
+                      clearInterval(intervalId);
+                      activeCalls.delete(key);
+                    }
+                  } else {
+                    // MIMO PIATKU → starý kredit (sekundy)
+                    const remaining = await decrementSeconds(callerId, 10);
+
+                    const caller = clients.get(callerId);
+                    if (caller?.ws?.readyState === WebSocket.OPEN) {
+                      caller.ws.send(JSON.stringify({ type: "balance-update", secondsRemaining: remaining }));
+                    }
+
+                    if (remaining <= 0) {
+                      const msg = JSON.stringify({ type: "end-call", reason: "no-tokens" });
+                      const callee = clients.get(calleeId);
+                      try { caller?.ws?.readyState === WebSocket.OPEN && caller.ws.send(msg); } catch {}
+                      try { callee?.ws?.readyState === WebSocket.OPEN && callee.ws.send(msg); } catch {}
+
+                      const endedAt = new Date();
+                      const secondsBilled = Math.ceil((endedAt - session.startedAt) / 1000);
+                      const priceEur = (secondsBilled * PRICE_PER_SECOND).toFixed(2);
+                      await prisma.callSession.update({
+                        where: { id: session.id },
+                        data: {
+                          endedAt,
+                          status: "no_tokens",
+                          secondsBilled,
+                          priceEur,
+                        },
+                      });
+
+                      clearInterval(intervalId);
+                      activeCalls.delete(key);
+                    }
                   }
                 } catch (e) {
                   console.error("decrement/billing interval error:", e);
@@ -438,7 +477,7 @@ wss.on("connection", (ws) => {
                 callSessionId: session.id,
               });
 
-              // pošli volajúcemu info, že hovor naozaj začal
+              // informuj volajúceho, že hovor naozaj začal
               const callerEntry = clients.get(callerId);
               if (callerEntry?.ws?.readyState === WebSocket.OPEN) {
                 callerEntry.ws.send(JSON.stringify({ type: "call-started", from: calleeId }));
@@ -461,7 +500,6 @@ wss.on("connection", (ws) => {
           }
         }
 
-        // zastav meter pre túto dvojicu a ulož CallSession
         const key = callKeyFor(currentUserId, data.targetId);
         const c = activeCalls.get(key);
         if (c) {
@@ -491,13 +529,11 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
-    // ak ktokoľvek z dvojice spadne, stopni meter
     if (currentUserId) {
       for (const [key, c] of activeCalls.entries()) {
         if (c.callerId === currentUserId || c.calleeId === currentUserId) {
           clearInterval(c.intervalId);
           activeCalls.delete(key);
-          // ukončiť aj CallSession ako 'aborted'
           (async () => {
             try {
               const endedAt = new Date();
@@ -522,7 +558,7 @@ wss.on("connection", (ws) => {
 
     if (currentUserId && clients.has(currentUserId)) {
       const entry = clients.get(currentUserId);
-      if (entry) entry.ws = null; // necháme fcmToken/role, user sa môže vrátiť
+      if (entry) entry.ws = null;
       console.log(`🔌 ${currentUserId} disconnected`);
     }
   });
@@ -532,7 +568,7 @@ wss.on("connection", (ws) => {
   });
 });
 
-// WS keepalive (pomôže na niektorých hostoch)
+// WS keepalive
 const interval = setInterval(() => {
   wss.clients.forEach((ws) => {
     if (ws.isAlive === false) return ws.terminate();
