@@ -32,6 +32,25 @@ app.use(
   })
 );
 
+// 1 token = 60 min
+const TOKEN_MINUTES = 60;
+const SECONDS_PER_TOKEN = TOKEN_MINUTES * 60;
+
+// Cenník balíkov – drž na backende ako zdroj pravdy
+function priceForTokens(tokens) {
+  // podľa tvojej burzy: 1,3,5,10
+  switch (tokens) {
+    case 1:  return 450;
+    case 3:  return 1280; // ~ -5%
+    case 5:  return 2070; // ~ -8%
+    case 10: return 3960; // ~ -12%
+    default:
+      // ak chceš povoliť ľubovoľné množstvo, môžeš hodiť linear: return tokens * 450;
+      throw new Error("Unsupported token pack");
+  }
+}
+
+
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
@@ -142,6 +161,64 @@ app.post("/purchase", async (req, res) => {
     return res.status(500).json({ error: "Server error" });
   }
 });
+
+app.post("/purchase-tokens", async (req, res) => {
+  try {
+    const { userId, tokens } = req.body || {};
+    if (!userId || !Number.isInteger(tokens) || tokens <= 0) {
+      return res.status(400).json({ success: false, message: "Missing or invalid userId/tokens" });
+    }
+
+    await ensureUser(userId);
+
+    // cenu rátaj na serveri
+    let amountEur = 0;
+    try {
+      amountEur = priceForTokens(tokens);
+    } catch (e) {
+      return res.status(400).json({ success: false, message: "Unsupported token pack" });
+    }
+
+    const secondsToAdd = tokens * SECONDS_PER_TOKEN;
+
+    // navýš kredit
+    await incrementSeconds(userId, secondsToAdd);
+
+    // zapíš transakciu (používam tvoju existujúcu tabuľku `transaction`)
+    await prisma.transaction.create({
+      data: {
+        userId,
+        type: "purchase",
+        amountEur: Number(amountEur),
+        secondsDelta: secondsToAdd,
+        note: `tokens:${tokens}`,
+      },
+    });
+
+    // zisti nový stav
+    const secondsRemaining = await getSeconds(userId);
+
+    // (nice-to-have) pošli okamžitý WS update, ak je user online
+    const entry = clients.get(userId);
+    if (entry?.ws?.readyState === WebSocket.OPEN) {
+      try {
+        entry.ws.send(JSON.stringify({ type: "balance-update", secondsRemaining }));
+      } catch {}
+    }
+
+    return res.json({
+      success: true,
+      tokensAdded: tokens,
+      secondsAdded: secondsToAdd,
+      secondsRemaining,
+      amountEur,
+    });
+  } catch (e) {
+    console.error("POST /purchase-tokens error:", e);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
 
 /** 
  * API endpoint na registráciu FCM tokenu po prihlásení 
