@@ -8,6 +8,15 @@ const {
 module.exports = function fridayRoutes(prisma) {
   const router = express.Router();
 
+  // helper – ak používateľ neexistuje, vytvor ho
+  async function ensureUser(userId) {
+    await prisma.user.upsert({
+      where: { id: userId },
+      update: {},
+      create: { id: userId },
+    });
+  }
+
   // Admin: emisia pre rok (mint do treasury = ownerId:null)
   router.post("/friday/mint-year", async (req, res) => {
     try {
@@ -83,7 +92,7 @@ module.exports = function fridayRoutes(prisma) {
         orderBy: [{ issuedYear: "asc" }, { createdAt: "asc" }],
         select: { id: true, issuedYear: true, minutesRemaining: true, status: true },
       });
-      const totalMinutes = tokens.filter(t=>t.status==="active").reduce((a, t) => a + t.minutesRemaining, 0);
+      const totalMinutes = tokens.filter(t => t.status === "active").reduce((a, t) => a + t.minutesRemaining, 0);
       return res.json({ userId, totalMinutes, tokens });
     } catch (e) {
       console.error("GET /friday/balance", e);
@@ -100,7 +109,6 @@ module.exports = function fridayRoutes(prisma) {
       }
       const y = Number(year) || new Date().getFullYear();
 
-      // koľko vlastní tento rok (aj mimo treasury)? Pre limit používame držané kusy z tohto roku
       const ownedThisYear = await prisma.fridayToken.count({
         where: { ownerId: userId, issuedYear: y },
       });
@@ -108,7 +116,6 @@ module.exports = function fridayRoutes(prisma) {
         return res.status(400).json({ success: false, message: `Primary limit is ${MAX_PRIMARY_TOKENS_PER_USER} tokens per user for year ${y}` });
       }
 
-      // dostupné v treasury
       const available = await prisma.fridayToken.findMany({
         where: { ownerId: null, issuedYear: y, status: "active" },
         take: quantity,
@@ -142,13 +149,12 @@ module.exports = function fridayRoutes(prisma) {
         });
       });
 
-      // vráť prehľad
       const tokens = await prisma.fridayToken.findMany({
         where: { ownerId: userId },
         select: { id: true, issuedYear: true, minutesRemaining: true, status: true },
         orderBy: [{ issuedYear: "asc" }, { createdAt: "asc" }],
       });
-      const totalMinutes = tokens.filter(t=>t.status==="active").reduce((a, t) => a + t.minutesRemaining, 0);
+      const totalMinutes = tokens.filter(t => t.status === "active").reduce((a, t) => a + t.minutesRemaining, 0);
 
       return res.json({ success: true, year: y, unitPrice, quantity, totalMinutes, tokens });
     } catch (e) {
@@ -196,7 +202,7 @@ module.exports = function fridayRoutes(prisma) {
     }
   });
 
-  // Zoznam otvorených listingov (burza)
+  // Zoznam otvorených listingov
   router.get("/friday/listings", async (req, res) => {
     try {
       const take = Math.min(Number(req.query.take) || 50, 100);
@@ -219,8 +225,13 @@ module.exports = function fridayRoutes(prisma) {
     try {
       const { buyerId, listingId } = req.body || {};
       if (!buyerId || !listingId) return res.status(400).json({ success: false, message: "Missing fields" });
+
       const listing = await prisma.fridayListing.findUnique({ where: { id: listingId } });
       if (!listing || listing.status !== "open") return res.status(400).json({ success: false, message: "Listing not available" });
+
+      // zabezpeč, že buyer aj seller existujú
+      await ensureUser(buyerId);
+      await ensureUser(listing.sellerId);
 
       await prisma.$transaction(async (tx) => {
         await tx.fridayListing.update({ where: { id: listingId }, data: { status: "sold", closedAt: new Date() } });
@@ -233,13 +244,12 @@ module.exports = function fridayRoutes(prisma) {
         });
       });
 
-      // vraciame nový piatkový zostatok kupujúceho
       const tokens = await prisma.fridayToken.findMany({
         where: { ownerId: buyerId },
         select: { id: true, issuedYear: true, minutesRemaining: true, status: true },
         orderBy: [{ issuedYear: "asc" }, { createdAt: "asc" }],
       });
-      const totalMinutes = tokens.filter(t=>t.status==="active").reduce((a, t) => a + t.minutesRemaining, 0);
+      const totalMinutes = tokens.filter(t => t.status === "active").reduce((a, t) => a + t.minutesRemaining, 0);
 
       return res.json({ success: true, totalMinutes, tokens });
     } catch (e) {
