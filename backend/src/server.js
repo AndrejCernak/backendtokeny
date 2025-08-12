@@ -381,7 +381,7 @@ wss.on("connection", (ws) => {
       }
 
       // WebRTC forwardovanie správ (pridávame aj 'from')
-      if (["webrtc-offer", "webrtc-answer", "webrtc-candidate"].includes(data.type)) {
+        if (["webrtc-offer", "webrtc-answer", "webrtc-candidate", "request-offer"].includes(data.type)) {
         if (!currentUserId || !data.targetId) return;
 
         console.log(`🔁 Forwarding ${data.type} from ${currentUserId} to ${data.targetId}`);
