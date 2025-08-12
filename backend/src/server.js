@@ -312,16 +312,6 @@ wss.on("connection", (ws) => {
             }
             return;
           }
-        } else {
-          // mimo piatku – buď povoľujeme bez limitu, alebo kontrola „bežného“ kreditu:
-          const seconds = await getSeconds(currentUserId);
-          if (seconds <= 0) {
-            const caller = clients.get(currentUserId);
-            if (caller?.ws?.readyState === WebSocket.OPEN) {
-              caller.ws.send(JSON.stringify({ type: "insufficient-tokens" }));
-            }
-            return;
-          }
         }
 
         console.log(`📞 Call request from ${currentUserId} to ${targetId}`);
@@ -420,72 +410,43 @@ wss.on("connection", (ws) => {
               // každých 10 s odpočítaj 10 s
               const intervalId = setInterval(async () => {
                 try {
-                  if (isFridayInBratislava()) {
-                    // PIATOK → piatkové tokeny
-                    const deficit = await consumeFridaySeconds(callerId, 10);
-                    const minutesLeft = await fridayMinutes(callerId);
+                    if (isFridayInBratislava()) {
+                      // PIATOK → piatkové tokeny
+                      const deficit = await consumeFridaySeconds(callerId, 10);
+                      const minutesLeft = await fridayMinutes(callerId);
 
-                    // live update klientovi (minúty)
-                    const caller = clients.get(callerId);
-                    if (caller?.ws?.readyState === WebSocket.OPEN) {
-                      caller.ws.send(JSON.stringify({ type: "friday-balance-update", minutesRemaining: minutesLeft }));
+                      // live update klientovi (minúty)
+                      const caller = clients.get(callerId);
+                      if (caller?.ws?.readyState === WebSocket.OPEN) {
+                        caller.ws.send(JSON.stringify({ type: "friday-balance-update", minutesRemaining: minutesLeft }));
+                      }
+
+                      if (deficit > 0 || minutesLeft <= 0) {
+                        // došli piatkové minúty – ukonči hovor
+                        const msg = JSON.stringify({ type: "end-call", reason: "no-friday-tokens" });
+                        const callee = clients.get(calleeId);
+                        try { caller?.ws?.readyState === WebSocket.OPEN && caller.ws.send(msg); } catch {}
+                        try { callee?.ws?.readyState === WebSocket.OPEN && callee.ws.send(msg); } catch {}
+
+                        const endedAt = new Date();
+                        const secondsBilled = Math.ceil((endedAt - session.startedAt) / 1000);
+                        const priceEur = (secondsBilled * PRICE_PER_SECOND).toFixed(2); // informatívne
+                        await prisma.callSession.update({
+                          where: { id: session.id },
+                          data: {
+                            endedAt,
+                            status: "no_tokens",
+                            secondsBilled,
+                            priceEur,
+                          },
+                        });
+
+                        clearInterval(intervalId);
+                        activeCalls.delete(key);
+                      }
                     }
+                    // mimo piatku: nič neúčtujeme, necháme hovor bežať
 
-                    if (deficit > 0 || minutesLeft <= 0) {
-                      // došli piatkové minúty – ukonči hovor
-                      const msg = JSON.stringify({ type: "end-call", reason: "no-friday-tokens" });
-                      const callee = clients.get(calleeId);
-                      try { caller?.ws?.readyState === WebSocket.OPEN && caller.ws.send(msg); } catch {}
-                      try { callee?.ws?.readyState === WebSocket.OPEN && callee.ws.send(msg); } catch {}
-
-                      const endedAt = new Date();
-                      const secondsBilled = Math.ceil((endedAt - session.startedAt) / 1000);
-                      const priceEur = (secondsBilled * PRICE_PER_SECOND).toFixed(2); // len informatívne
-                      await prisma.callSession.update({
-                        where: { id: session.id },
-                        data: {
-                          endedAt,
-                          status: "no_tokens",
-                          secondsBilled,
-                          priceEur,
-                        },
-                      });
-
-                      clearInterval(intervalId);
-                      activeCalls.delete(key);
-                    }
-                  } else {
-                    // MIMO PIATKU → starý kredit (sekundy)
-                    const remaining = await decrementSeconds(callerId, 10);
-
-                    const caller = clients.get(callerId);
-                    if (caller?.ws?.readyState === WebSocket.OPEN) {
-                      caller.ws.send(JSON.stringify({ type: "balance-update", secondsRemaining: remaining }));
-                    }
-
-                    if (remaining <= 0) {
-                      const msg = JSON.stringify({ type: "end-call", reason: "no-tokens" });
-                      const callee = clients.get(calleeId);
-                      try { caller?.ws?.readyState === WebSocket.OPEN && caller.ws.send(msg); } catch {}
-                      try { callee?.ws?.readyState === WebSocket.OPEN && callee.ws.send(msg); } catch {}
-
-                      const endedAt = new Date();
-                      const secondsBilled = Math.ceil((endedAt - session.startedAt) / 1000);
-                      const priceEur = (secondsBilled * PRICE_PER_SECOND).toFixed(2);
-                      await prisma.callSession.update({
-                        where: { id: session.id },
-                        data: {
-                          endedAt,
-                          status: "no_tokens",
-                          secondsBilled,
-                          priceEur,
-                        },
-                      });
-
-                      clearInterval(intervalId);
-                      activeCalls.delete(key);
-                    }
-                  }
                 } catch (e) {
                   console.error("decrement/billing interval error:", e);
                 }
