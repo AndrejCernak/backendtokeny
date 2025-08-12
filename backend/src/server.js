@@ -213,24 +213,37 @@ app.post("/purchase-tokens", async (req, res) => {
   }
 });
 
-/** 
- * API endpoint na registráciu FCM tokenu po prihlásení 
+/**
+ * API endpoint na registráciu FCM tokenu po prihlásení (PERSISTENT)
  */
-app.post("/register-fcm", (req, res) => {
-  const { userId, fcmToken, role } = req.body || {};
+app.post("/register-fcm", async (req, res) => {
+  const { userId, fcmToken, role, platform } = req.body || {};
   if (!userId || !fcmToken) {
     return res.status(400).json({ error: "Missing userId or fcmToken" });
   }
 
-  if (!clients.has(userId)) {
-    clients.set(userId, { ws: null, fcmToken, role });
-  } else {
-    const entry = clients.get(userId);
-    entry.fcmToken = fcmToken;
-    if (role) entry.role = role;
-  }
+  try {
+    // pamäť (live WS routing)
+    if (!clients.has(userId)) {
+      clients.set(userId, { ws: null, fcmToken, role });
+    } else {
+      const entry = clients.get(userId);
+      entry.fcmToken = fcmToken;
+      if (role) entry.role = role;
+    }
 
-  return res.json({ success: true });
+    // DB persist (vyžaduje Prisma model PushToken)
+    await prisma.pushToken.upsert({
+      where: { token: fcmToken },
+      update: { userId, platform: platform || null },
+      create: { userId, token: fcmToken, platform: platform || null },
+    });
+
+    return res.json({ success: true });
+  } catch (e) {
+    console.error("register-fcm error:", e);
+    return res.status(500).json({ error: "Server error" });
+  }
 });
 
 /**
@@ -336,11 +349,20 @@ wss.on("connection", (ws) => {
           }
         }
 
-        // Poslať FCM notifikáciu (ak máme token)
-        if (target?.fcmToken) {
-          try {
+        // Poslať FCM notifikáciu (DB fallback)
+        try {
+          let targetToken = target?.fcmToken;
+          if (!targetToken) {
+            const dbTok = await prisma.pushToken.findFirst({
+              where: { userId: targetId },
+              orderBy: { updatedAt: "desc" },
+            });
+            targetToken = dbTok?.token || null;
+          }
+
+          if (targetToken) {
             await admin.messaging().send({
-              token: target.fcmToken,
+              token: targetToken,
               notification: {
                 title: "Prichádzajúci hovor",
                 body: `${callerName} ti volá`,
@@ -352,9 +374,9 @@ wss.on("connection", (ws) => {
               },
             });
             console.log(`📩 Push notification sent to ${targetId}`);
-          } catch (e) {
-            console.error("❌ FCM send error:", e);
           }
+        } catch (e) {
+          console.error("❌ FCM send error:", e);
         }
       }
 
