@@ -4,11 +4,11 @@
   "main": "src/server.js",
   "type": "commonjs",
   "scripts": {
-    "dev": "node src/server.js",
-    "start": "npx prisma migrate deploy && node src/server.js",
-    "prisma:studio": "npx prisma studio",
-    "prisma:migrate": "npx prisma migrate dev",
-    "prisma:generate": "npx prisma generate"
+    "dev": "ts-node-dev --respawn --transpile-only server.ts",
+    "build": "tsc",
+    "postinstall": "prisma generate",
+    "start": "node dist/server.js",
+    "migrate:deploy": "prisma migrate deploy"
   },
   "dependencies": {
     "@prisma/client": "^6.13.0",
@@ -19,6 +19,13 @@
     "ws": "^8.18.3"
   },
   "devDependencies": {
-    "prisma": "^6.13.0"
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.2.1",
+    "@types/ws": "^8.18.1",
+    "prisma": "^6.13.0",
+    "ts-node": "^10.9.2",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.9.2"
   }
 }

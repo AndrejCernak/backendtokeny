@@ -1,24 +1,16 @@
-const express = require("express");
-const {
-  MAX_PRIMARY_TOKENS_PER_USER,
-  priceForYear,
-  countFridaysInYear,
-} = require("./config");
+// friday/routes.ts
+import express, { Request, Response } from "express";
+import { PrismaClient } from "@prisma/client";
+import { MAX_PRIMARY_TOKENS_PER_USER, priceForYear, countFridaysInYear } from "./config";
 
-module.exports = function fridayRoutes(prisma) {
+export default function fridayRoutes(prisma: PrismaClient) {
   const router = express.Router();
 
-  // helper – ak používateľ neexistuje, vytvor ho
-  async function ensureUser(userId) {
-    await prisma.user.upsert({
-      where: { id: userId },
-      update: {},
-      create: { id: userId },
-    });
+  async function ensureUser(userId: string) {
+    await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
   }
 
-  // Admin: emisia pre rok (mint do treasury = ownerId:null)
-  router.post("/friday/mint-year", async (req, res) => {
+  router.post("/friday/mint-year", async (req: Request, res: Response) => {
     try {
       const { year } = req.body || {};
       const y = Number(year) || new Date().getFullYear();
@@ -26,22 +18,14 @@ module.exports = function fridayRoutes(prisma) {
       if (exists) return res.status(400).json({ success: false, message: "Supply already minted for this year" });
 
       const fridays = countFridaysInYear(y);
-      const totalTokens = fridays * 6; // 6 hodín = 6 tokenov na piatok
+      const totalTokens = fridays * 6;
       const unitPrice = priceForYear(y);
 
       await prisma.$transaction(async (tx) => {
-        await tx.fridaySupply.create({
-          data: { year: y, totalMinted: totalTokens, priceEur: unitPrice },
-        });
-
+        await tx.fridaySupply.create({ data: { year: y, totalMinted: totalTokens, priceEur: unitPrice } });
         const batch = Array.from({ length: totalTokens }, () => ({
-          issuedYear: y,
-          ownerId: null,
-          minutesRemaining: 60,
-          status: "active",
-          originalPriceEur: unitPrice,
+          issuedYear: y, ownerId: null, minutesRemaining: 60, status: "active" as const, originalPriceEur: unitPrice
         }));
-
         const CHUNK = 1000;
         for (let i = 0; i < batch.length; i += CHUNK) {
           await tx.fridayToken.createMany({ data: batch.slice(i, i + CHUNK) });
@@ -55,36 +39,30 @@ module.exports = function fridayRoutes(prisma) {
     }
   });
 
-  // Info o supply/cene pre rok
-  router.get("/friday/supply", async (req, res) => {
-    try {
-      const y = Number(req.query.year) || new Date().getFullYear();
-      let sup = await prisma.fridaySupply.findUnique({ where: { year: y } });
-      if (!sup) {
-        sup = {
-          year: y,
-          totalMinted: 0,
-          totalSold: 0,
-          priceEur: priceForYear(y),
-          createdAt: new Date(),
-        };
-      }
-      const treasuryCount = await prisma.fridayToken.count({ where: { ownerId: null, issuedYear: y, status: "active" } });
-      return res.json({
-        year: y,
-        priceEur: Number(sup.priceEur),
-        treasuryAvailable: treasuryCount,
-        totalMinted: sup.totalMinted,
-        totalSold: sup.totalSold,
-      });
-    } catch (e) {
-      console.error("GET /friday/supply", e);
-      return res.status(500).json({ success: false, message: "Server error" });
-    }
-  });
+ router.get("/friday/supply", async (req, res) => {
+  try {
+    const y = Number((req.query.year as string) || new Date().getFullYear());
+    const sup = await prisma.fridaySupply.findUnique({ where: { year: y } });
+    const priceEur = sup ? Number(sup.priceEur) : priceForYear(y);
+    const treasuryCount = await prisma.fridayToken.count({
+      where: { ownerId: null, issuedYear: y, status: "active" },
+    });
 
-  // Piatkový zostatok
-  router.get("/friday/balance/:userId", async (req, res) => {
+    return res.json({
+      year: y,
+      priceEur,
+      treasuryAvailable: treasuryCount,
+      totalMinted: sup?.totalMinted ?? 0,
+      totalSold: sup?.totalSold ?? 0,
+    });
+  } catch (e) {
+    console.error("GET /friday/supply", e);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+
+  router.get("/friday/balance/:userId", async (req: Request, res: Response) => {
     try {
       const { userId } = req.params;
       const tokens = await prisma.fridayToken.findMany({
@@ -100,8 +78,7 @@ module.exports = function fridayRoutes(prisma) {
     }
   });
 
-  // Primárny nákup z treasury (limit 20 ks / user / rok)
-  router.post("/friday/purchase", async (req, res) => {
+  router.post("/friday/purchase", async (req: Request, res: Response) => {
     try {
       const { userId, quantity, year } = req.body || {};
       if (!userId || !Number.isInteger(quantity) || quantity <= 0) {
@@ -109,9 +86,7 @@ module.exports = function fridayRoutes(prisma) {
       }
       const y = Number(year) || new Date().getFullYear();
 
-      const ownedThisYear = await prisma.fridayToken.count({
-        where: { ownerId: userId, issuedYear: y },
-      });
+      const ownedThisYear = await prisma.fridayToken.count({ where: { ownerId: userId, issuedYear: y } });
       if (ownedThisYear + quantity > MAX_PRIMARY_TOKENS_PER_USER) {
         return res.status(400).json({ success: false, message: `Primary limit is ${MAX_PRIMARY_TOKENS_PER_USER} tokens per user for year ${y}` });
       }
@@ -129,18 +104,9 @@ module.exports = function fridayRoutes(prisma) {
       const amountEur = unitPrice * quantity;
 
       await prisma.$transaction(async (tx) => {
-        await tx.fridayToken.updateMany({
-          where: { id: { in: available.map(a => a.id) } },
-          data: { ownerId: userId },
-        });
+        await tx.fridayToken.updateMany({ where: { id: { in: available.map(a => a.id) } }, data: { ownerId: userId } });
         await tx.transaction.create({
-          data: {
-            userId,
-            type: "friday_purchase",
-            amountEur: amountEur,
-            secondsDelta: 0,
-            note: `friday:${y}; qty:${quantity}`,
-          },
+          data: { userId, type: "friday_purchase", amountEur: amountEur, secondsDelta: 0, note: `friday:${y}; qty:${quantity}` }
         });
         await tx.fridaySupply.upsert({
           where: { year: y },
@@ -163,8 +129,7 @@ module.exports = function fridayRoutes(prisma) {
     }
   });
 
-  // Zalistovať token na burzu
-  router.post("/friday/list", async (req, res) => {
+  router.post("/friday/list", async (req: Request, res: Response) => {
     try {
       const { sellerId, tokenId, priceEur } = req.body || {};
       if (!sellerId || !tokenId || !priceEur) return res.status(400).json({ success: false, message: "Missing fields" });
@@ -183,8 +148,7 @@ module.exports = function fridayRoutes(prisma) {
     }
   });
 
-  // Zrušiť listing
-  router.post("/friday/cancel-listing", async (req, res) => {
+  router.post("/friday/cancel-listing", async (req: Request, res: Response) => {
     try {
       const { sellerId, listingId } = req.body || {};
       const listing = await prisma.fridayListing.findUnique({ where: { id: listingId }, include: { token: true } });
@@ -202,11 +166,10 @@ module.exports = function fridayRoutes(prisma) {
     }
   });
 
-  // Zoznam otvorených listingov
-  router.get("/friday/listings", async (req, res) => {
+  router.get("/friday/listings", async (_req: Request, res: Response) => {
     try {
-      const take = Math.min(Number(req.query.take) || 50, 100);
-      const skip = Number(req.query.skip) || 0;
+      const take = 50;
+      const skip = 0;
       const items = await prisma.fridayListing.findMany({
         where: { status: "open" },
         orderBy: { createdAt: "desc" },
@@ -220,43 +183,5 @@ module.exports = function fridayRoutes(prisma) {
     }
   });
 
-  // Kúpa z burzy
-  router.post("/friday/buy-listing", async (req, res) => {
-    try {
-      const { buyerId, listingId } = req.body || {};
-      if (!buyerId || !listingId) return res.status(400).json({ success: false, message: "Missing fields" });
-
-      const listing = await prisma.fridayListing.findUnique({ where: { id: listingId } });
-      if (!listing || listing.status !== "open") return res.status(400).json({ success: false, message: "Listing not available" });
-
-      // zabezpeč, že buyer aj seller existujú
-      await ensureUser(buyerId);
-      await ensureUser(listing.sellerId);
-
-      await prisma.$transaction(async (tx) => {
-        await tx.fridayListing.update({ where: { id: listingId }, data: { status: "sold", closedAt: new Date() } });
-        await tx.fridayToken.update({ where: { id: listing.tokenId }, data: { ownerId: buyerId, status: "active" } });
-        await tx.transaction.createMany({
-          data: [
-            { userId: buyerId, type: "friday_trade_buy", amountEur: Number(listing.priceEur), secondsDelta: 0, note: `listing:${listingId}` },
-            { userId: listing.sellerId, type: "friday_trade_sell", amountEur: Number(-listing.priceEur), secondsDelta: 0, note: `listing:${listingId}` },
-          ],
-        });
-      });
-
-      const tokens = await prisma.fridayToken.findMany({
-        where: { ownerId: buyerId },
-        select: { id: true, issuedYear: true, minutesRemaining: true, status: true },
-        orderBy: [{ issuedYear: "asc" }, { createdAt: "asc" }],
-      });
-      const totalMinutes = tokens.filter(t => t.status === "active").reduce((a, t) => a + t.minutesRemaining, 0);
-
-      return res.json({ success: true, totalMinutes, tokens });
-    } catch (e) {
-      console.error("POST /friday/buy-listing", e);
-      return res.status(500).json({ success: false, message: "Server error" });
-    }
-  });
-
   return router;
-};
+}

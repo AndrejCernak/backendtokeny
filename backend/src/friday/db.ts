@@ -1,8 +1,8 @@
-// DB helpery pre piatkové tokeny
-const { PrismaClient } = require("@prisma/client");
+// friday/db.ts
+import { PrismaClient } from "@prisma/client";
 const prisma = new PrismaClient();
 
-async function fridayMinutes(userId) {
+export async function fridayMinutes(userId: string) {
   const tokens = await prisma.fridayToken.findMany({
     where: { ownerId: userId, status: "active", minutesRemaining: { gt: 0 } },
     select: { minutesRemaining: true },
@@ -10,11 +10,12 @@ async function fridayMinutes(userId) {
   return tokens.reduce((a, t) => a + t.minutesRemaining, 0);
 }
 
-async function consumeFridaySeconds(userId, seconds) {
+export async function consumeFridaySeconds(userId: string, seconds: number) {
   const tokens = await prisma.fridayToken.findMany({
     where: { ownerId: userId, status: "active", minutesRemaining: { gt: 0 } },
     orderBy: [{ issuedYear: "asc" }, { createdAt: "asc" }],
   });
+
   let restSec = seconds;
   for (const t of tokens) {
     if (restSec <= 0) break;
@@ -28,10 +29,5 @@ async function consumeFridaySeconds(userId, seconds) {
     });
     restSec -= usedSec;
   }
-  return restSec;
+  return restSec; // deficit ak > 0
 }
-
-module.exports = {
-  fridayMinutes,
-  consumeFridaySeconds,
-};
