@@ -14,8 +14,6 @@ declare module "ws" {
   }
 }
 
-
-
 // Friday modules (TS verzie)
 import fridayRoutes from "./friday/routes";
 import { isFridayInBratislava } from "./friday/config";
@@ -45,6 +43,39 @@ app.use(
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
+
+// ====== ADMIN / SUPPLY HELPERS (GLOBAL) =====================================
+const ADMIN_ID = process.env.ADMIN_ID || "";
+// Ak máš v schéme FridaySupply.year @id, použijeme ho ako "globálny kľúč"
+const SUPPLY_KEY = 1; // jediný riadok v FridaySupply reprezentuje globálnu pokladnicu
+
+function assertAdmin(adminId?: string) {
+  if (!adminId || adminId !== ADMIN_ID) {
+    const e: any = new Error("Not authorized");
+    e.status = 403;
+    throw e;
+  }
+}
+
+function parsePositiveInt(value: any, field: string) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+    const e: any = new Error(`${field} musí byť celé číslo > 0.`);
+    e.status = 400;
+    throw e;
+  }
+  return n;
+}
+
+function parsePrice(value: any, field = "priceEur") {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) {
+    const e: any = new Error(`${field} musí byť číslo > 0.`);
+    e.status = 400;
+    throw e;
+  }
+  return Math.round(n * 100) / 100;
+}
 
 // Mapy spojení
 type Role = "client" | "admin";
@@ -108,10 +139,106 @@ app.post("/register-fcm", async (req, res) => {
   }
 });
 
-// Friday routes mount
+// Friday routes mount (tvoje existujúce endpointy ostávajú)
 app.use("/", fridayRoutes(prisma));
 
-// WebSocket
+/**
+ * ====== NOVÉ ADMIN ENDPOINTY (BEZ ROČNÍKOV) =================================
+ * - /friday/admin/mint               { adminId, quantity, priceEur }
+ * - /friday/admin/update-price       { adminId, newPriceEur }
+ *
+ * Všetko je globálne: žiadne roky. FridaySupply udržiava JEDEN riadok s id=SUPPLY_KEY.
+ * Nepredané tokeny = FridayToken s ownerId = null a status = 'active'.
+ */
+
+// POST /friday/admin/mint { adminId, quantity, priceEur }
+app.post("/friday/admin/mint", async (req, res) => {
+  try {
+    const { adminId, quantity, priceEur } = (req.body || {}) as {
+      adminId?: string;
+      quantity?: number;
+      priceEur?: number;
+    };
+
+    assertAdmin(adminId);
+    const qty = parsePositiveInt(quantity, "quantity");
+    const price = parsePrice(priceEur, "priceEur");
+
+    // 1) Upsert FridaySupply (globálne): navýšime totalMinted a nastavíme "primárnu" cenu
+    await prisma.fridaySupply.upsert({
+      where: { year: SUPPLY_KEY },
+      update: {
+        totalMinted: { increment: qty },
+        priceEur: price,
+      },
+      create: {
+        year: SUPPLY_KEY,
+        totalMinted: qty,
+        totalSold: 0,
+        priceEur: price,
+      },
+    });
+
+    // 2) Vytvoríme qty kusov FridayToken (bez ownera)
+    const data = Array.from({ length: qty }, () => ({
+      // issuedYear môže ostať, ale nastavíme ho na SUPPLY_KEY, alebo 0 (podľa tvojej schémy)
+      issuedYear: SUPPLY_KEY,
+      ownerId: null as string | null,
+      minutesRemaining: 60,
+      status: "active" as const,
+      originalPriceEur: price,
+    }));
+    const result = await prisma.fridayToken.createMany({ data });
+
+    return res.json({
+      success: true,
+      minted: result.count,
+      priceEur: price,
+      message: `Vygenerovaných ${result.count} tokenov s cenou ${price} €/ks.`,
+    });
+  } catch (e: any) {
+    console.error("admin/mint error:", e);
+    return res.status(e.status ?? 500).json({ success: false, message: e.message ?? "Mint failed" });
+  }
+});
+
+// POST /friday/admin/update-price { adminId, newPriceEur }
+app.post("/friday/admin/update-price", async (req, res) => {
+  try {
+    const { adminId, newPriceEur } = (req.body || {}) as {
+      adminId?: string;
+      newPriceEur?: number;
+    };
+
+    assertAdmin(adminId);
+    const newPrice = parsePrice(newPriceEur, "newPriceEur");
+
+    // 1) FridaySupply (globálne) – nastavíme novú primárnu cenu
+    await prisma.fridaySupply.upsert({
+      where: { year: SUPPLY_KEY },
+      update: { priceEur: newPrice },
+      create: { year: SUPPLY_KEY, totalMinted: 0, totalSold: 0, priceEur: newPrice },
+    });
+
+    // 2) Prepis ceny všetkých NEPREDANÝCH aktívnych tokenov
+    const upd = await prisma.fridayToken.updateMany({
+      where: { ownerId: null, status: "active" },
+      data: { originalPriceEur: newPrice },
+    });
+
+    return res.json({
+      success: true,
+      updatedUnsold: upd.count,
+      priceEur: newPrice,
+      message: `Cena nastavená na ${newPrice} € (upravených ${upd.count} nepredaných tokenov).`,
+    });
+  } catch (e: any) {
+    console.error("admin/update-price error:", e);
+    return res.status(e.status ?? 500).json({ success: false, message: e.message ?? "Update price failed" });
+  }
+});
+
+// ===================== WebSocket & hovory (tvoje pôvodné) ====================
 wss.on("connection", (ws: WebSocket) => {
   let currentUserId: string | null = null;
 
@@ -385,8 +512,6 @@ const interval = setInterval(() => {
     } catch {}
   });
 }, 30000);
-
-// Removed invalid wss "close" event listener; cleanup is handled by process signals below.
 
 // graceful shutdown
 process.on("SIGINT", async () => {

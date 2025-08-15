@@ -136,11 +136,15 @@ enum FridayTokenStatus {
  * Evidencia emisie v danom roku (treasury).
  */
 model FridaySupply {
-  year        Int      @id
-  totalMinted Int
-  totalSold   Int      @default(0)
-  priceEur    Decimal  @db.Decimal(10, 2)
-  createdAt   DateTime @default(now())
+  year              Int      @id
+  priceEur          Decimal  @db.Decimal(10,2)
+  treasuryAvailable Int      @default(0)
+  totalMinted       Int      @default(0)
+  totalSold         Int      @default(0)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@map("friday_supply")
 }
 
 /**
