@@ -13,11 +13,8 @@ declare module "ws" {
     isAlive?: boolean;
   }
 }
-
-
-
-// Friday modules (TS verzie)
 import fridayRoutes from "./friday/routes";
+// Friday modules (TS verzie)
 import { isFridayInBratislava } from "./friday/config";
 import { fridayMinutes, consumeFridaySeconds } from "./friday/db";
 
@@ -117,15 +114,14 @@ app.post("/register-fcm", async (req, res) => {
 });
 
 // Friday routes mount
-app.use("/api", fridayRoutes(prisma));
+app.use("/", fridayRoutes(prisma));
+
+app.get("/health", (_req, res) => res.json({ ok: true }));
+
 
 app.use((_req, res) => {
   res.status(404).json({ ok: false, error: "Not found" });
 });
-
-
-app.get?.("/health", (_req, res) => res.json({ ok: true }));
-
 
 
 // WebSocket
