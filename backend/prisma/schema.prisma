@@ -136,7 +136,7 @@ enum FridayTokenStatus {
  * Evidencia emisie v danom roku (treasury).
  */
 model FridaySupply {
-  year        Int      @id
+  year         Int      @id             // ← najjednoduchšie: sprav z neho primary key
   totalMinted Int
   totalSold   Int      @default(0)
   priceEur    Decimal  @db.Decimal(10, 2)
