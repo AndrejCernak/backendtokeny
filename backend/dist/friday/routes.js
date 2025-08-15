@@ -142,6 +142,61 @@ function fridayRoutes(prisma) {
             return res.status(500).json({ success: false, message: "Server error" });
         }
     });
+    router.post("/friday/buy-listing", async (req, res) => {
+        try {
+            const { buyerId, listingId } = req.body || {};
+            if (!buyerId || !listingId) {
+                return res.status(400).json({ success: false, message: "Missing buyerId/listingId" });
+            }
+            const listing = await prisma.fridayListing.findUnique({
+                where: { id: listingId },
+                include: { token: true },
+            });
+            if (!listing || listing.status !== "open") {
+                return res.status(400).json({ success: false, message: "Listing not available" });
+            }
+            if (!listing.token || listing.token.status !== "listed") {
+                return res.status(400).json({ success: false, message: "Token not listed" });
+            }
+            if (listing.sellerId === buyerId) {
+                return res.status(400).json({ success: false, message: "Seller cannot buy own token" });
+            }
+            await prisma.$transaction(async (tx) => {
+                await tx.fridayListing.update({
+                    where: { id: listingId },
+                    data: { status: "sold", closedAt: new Date() },
+                });
+                // If you want to record the buyer, make sure your schema has a buyerId field and update it in a separate call:
+                // await tx.fridayListing.update({ where: { id: listingId }, data: { buyerId } });
+                await tx.fridayToken.update({
+                    where: { id: listing.tokenId },
+                    data: { ownerId: buyerId, status: "active" },
+                });
+                await tx.transaction.create({
+                    data: {
+                        userId: buyerId,
+                        type: "friday_secondary_buy", // TODO: Replace 'as any' with the correct TransactionType enum, e.g. $Enums.TransactionType.FridaySecondaryBuy
+                        amountEur: Number(listing.priceEur),
+                        secondsDelta: 0,
+                        note: `listing:${listingId}`,
+                    },
+                });
+            });
+            // vráť nový stav buyer balancu (nepovinné, ale handy pre UI)
+            const tokens = await prisma.fridayToken.findMany({
+                where: { ownerId: buyerId },
+                orderBy: [{ issuedYear: "asc" }, { createdAt: "asc" }],
+                select: { id: true, issuedYear: true, minutesRemaining: true, status: true },
+            });
+            const totalMinutes = tokens.filter(t => t.status === "active")
+                .reduce((a, t) => a + t.minutesRemaining, 0);
+            return res.json({ success: true, totalMinutes, tokens });
+        }
+        catch (e) {
+            console.error("POST /friday/buy-listing", e);
+            return res.status(500).json({ success: false, message: "Server error" });
+        }
+    });
     router.post("/friday/cancel-listing", async (req, res) => {
         try {
             const { sellerId, listingId } = req.body || {};
