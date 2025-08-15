@@ -13,8 +13,11 @@ declare module "ws" {
     isAlive?: boolean;
   }
 }
-import fridayRoutes from "./friday/routes";
+
+
+
 // Friday modules (TS verzie)
+import fridayRoutes from "./friday/routes";
 import { isFridayInBratislava } from "./friday/config";
 import { fridayMinutes, consumeFridaySeconds } from "./friday/db";
 
@@ -25,26 +28,18 @@ app.use(express.json());
 // CORS
 const allowedOrigins = [
   "https://frontendtokeny.vercel.app",
+  "https://frontendtokeny-42hveafvm-andrejcernaks-projects.vercel.app",
   "http://localhost:3000",
 ];
 
 app.use(
   cors({
     origin(origin, callback) {
-      // povoliť localhost, presnú prod doménu a ľubovoľné *.vercel.app preview
-      if (
-        !origin ||
-        allowedOrigins.includes(origin) ||
-        /\.vercel\.app$/.test(origin)
-      ) {
-        callback(null, true);
-      } else {
-        callback(new Error("Not allowed by CORS"));
-      }
+      if (!origin || allowedOrigins.includes(origin)) callback(null, true);
+      else callback(new Error("Not allowed by CORS"));
     },
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: true,
   })
 );
 
@@ -115,14 +110,6 @@ app.post("/register-fcm", async (req, res) => {
 
 // Friday routes mount
 app.use("/", fridayRoutes(prisma));
-
-app.get("/health", (_req, res) => res.json({ ok: true }));
-
-
-app.use((_req, res) => {
-  res.status(404).json({ ok: false, error: "Not found" });
-});
-
 
 // WebSocket
 wss.on("connection", (ws: WebSocket) => {

@@ -44,8 +44,8 @@ const http_1 = __importDefault(require("http"));
 const cors_1 = __importDefault(require("cors"));
 const firebase_admin_1 = __importDefault(require("./firebase-admin"));
 const client_1 = require("@prisma/client");
-const routes_1 = __importDefault(require("./friday/routes"));
 // Friday modules (TS verzie)
+const routes_1 = __importDefault(require("./friday/routes"));
 const config_1 = require("./friday/config");
 const db_1 = require("./friday/db");
 const prisma = new client_1.PrismaClient();
@@ -54,23 +54,18 @@ app.use(express_1.default.json());
 // CORS
 const allowedOrigins = [
     "https://frontendtokeny.vercel.app",
+    "https://frontendtokeny-42hveafvm-andrejcernaks-projects.vercel.app",
     "http://localhost:3000",
 ];
 app.use((0, cors_1.default)({
     origin(origin, callback) {
-        // povoliť localhost, presnú prod doménu a ľubovoľné *.vercel.app preview
-        if (!origin ||
-            allowedOrigins.includes(origin) ||
-            /\.vercel\.app$/.test(origin)) {
+        if (!origin || allowedOrigins.includes(origin))
             callback(null, true);
-        }
-        else {
+        else
             callback(new Error("Not allowed by CORS"));
-        }
     },
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: true,
 }));
 const server = http_1.default.createServer(app);
 const wss = new ws_1.WebSocketServer({ server });
@@ -116,10 +111,6 @@ app.post("/register-fcm", async (req, res) => {
 });
 // Friday routes mount
 app.use("/", (0, routes_1.default)(prisma));
-app.get("/health", (_req, res) => res.json({ ok: true }));
-app.use((_req, res) => {
-    res.status(404).json({ ok: false, error: "Not found" });
-});
 // WebSocket
 wss.on("connection", (ws) => {
     let currentUserId = null;
