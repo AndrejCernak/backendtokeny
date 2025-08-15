@@ -109,18 +109,22 @@ enum CallStatus {
 model FridayToken {
   id               String             @id @default(cuid())
   ownerId          String?
+  issuedYear       Int
   minutesRemaining Int                @default(60)
   status           FridayTokenStatus  @default(active)
   createdAt        DateTime           @default(now())
   originalPriceEur Decimal            @db.Decimal(10, 2)
 
+  // väzba na User (pomenovaná relácia + spätné pole v User.fridayTokens)
   owner            User?              @relation("UserFridayTokens", fields: [ownerId], references: [id], onDelete: SetNull)
+
+  // spätné pole k FridayListing.token (1:1, tokenId je unique)
   listing          FridayListing?     @relation("TokenListing")
 
   @@index([ownerId])
+  @@index([issuedYear])
   @@index([status])
 }
-
 
 enum FridayTokenStatus {
   active
@@ -132,18 +136,12 @@ enum FridayTokenStatus {
  * Evidencia emisie v danom roku (treasury).
  */
 model FridaySupply {
-  id                String   @id @default("GLOBAL") @db.VarChar(32)
-  priceEur          Decimal  @db.Decimal(10, 2)
-  treasuryAvailable Int      @default(0)
-  totalMinted       Int      @default(0)
-  totalSold         Int      @default(0)
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
-
-  @@map("friday_supply")
+  year        Int      @id
+  totalMinted Int
+  totalSold   Int      @default(0)
+  priceEur    Decimal  @db.Decimal(10, 2)
+  createdAt   DateTime @default(now())
 }
-
-
 
 /**
  * Sekundárny trh – listing jedného konkrétneho tokenu.

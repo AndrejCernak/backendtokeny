@@ -13,7 +13,7 @@ export async function fridayMinutes(userId: string) {
 export async function consumeFridaySeconds(userId: string, seconds: number) {
   const tokens = await prisma.fridayToken.findMany({
     where: { ownerId: userId, status: "active", minutesRemaining: { gt: 0 } },
-    orderBy: { createdAt: "asc" }, // odstránený issuedYear
+    orderBy: [{ issuedYear: "asc" }, { createdAt: "asc" }],
   });
 
   let restSec = seconds;

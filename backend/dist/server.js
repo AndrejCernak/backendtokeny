@@ -44,14 +44,14 @@ const http_1 = __importDefault(require("http"));
 const cors_1 = __importDefault(require("cors"));
 const firebase_admin_1 = __importDefault(require("./firebase-admin"));
 const client_1 = require("@prisma/client");
-// Friday moduly (tvoje existujúce)
+// Friday modules (TS verzie)
 const routes_1 = __importDefault(require("./friday/routes"));
 const config_1 = require("./friday/config");
 const db_1 = require("./friday/db");
 const prisma = new client_1.PrismaClient();
 const app = (0, express_1.default)();
 app.use(express_1.default.json());
-// ===== CORS =====
+// CORS
 const allowedOrigins = [
     "https://frontendtokeny.vercel.app",
     "https://frontendtokeny-42hveafvm-andrejcernaks-projects.vercel.app",
@@ -69,34 +69,6 @@ app.use((0, cors_1.default)({
 }));
 const server = http_1.default.createServer(app);
 const wss = new ws_1.WebSocketServer({ server });
-// ====== ADMIN / SUPPLY HELPERS (GLOBAL, BEZ ROČNÍKOV) =======================
-const ADMIN_ID = process.env.ADMIN_ID || "";
-const SUPPLY_ID = "GLOBAL"; // jediný riadok v FridaySupply reprezentuje globálnu pokladnicu
-function assertAdmin(adminId) {
-    if (!adminId || adminId !== ADMIN_ID) {
-        const e = new Error("Not authorized");
-        e.status = 403;
-        throw e;
-    }
-}
-function parsePositiveInt(value, field) {
-    const n = Number(value);
-    if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
-        const e = new Error(`${field} musí byť celé číslo > 0.`);
-        e.status = 400;
-        throw e;
-    }
-    return n;
-}
-function parsePrice(value, field = "priceEur") {
-    const n = Number(value);
-    if (!Number.isFinite(n) || n <= 0) {
-        const e = new Error(`${field} musí byť číslo > 0.`);
-        e.status = 400;
-        throw e;
-    }
-    return Math.round(n * 100) / 100;
-}
 const clients = new Map();
 const pendingCalls = new Map();
 const PENDING_TTL_MS = 90 * 1000;
@@ -108,7 +80,7 @@ function callKeyFor(a, b) {
 async function ensureUser(userId) {
     await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
 }
-// ===== REST: ukladanie FCM tokenu (ponechané) =================================
+// REST: push token persist
 app.post("/register-fcm", async (req, res) => {
     const body = (req.body || {});
     const { userId, fcmToken, role, platform } = body;
@@ -137,86 +109,9 @@ app.post("/register-fcm", async (req, res) => {
         return res.status(500).json({ error: "Server error" });
     }
 });
-// ===== EXISTUJÚCE FRIDAY ROUTES (ponechané – nákup, listingy, balans) ========
+// Friday routes mount
 app.use("/", (0, routes_1.default)(prisma));
-/**
- * ====== NOVÉ ADMIN ENDPOINTY (BEZ ROČNÍKOV) =================================
- * - POST /friday/admin/mint         { adminId, quantity, priceEur }
- *      → navýši FridaySupply.totalMinted, nastaví aktuálnu cenu, vytvorí N tokenov v pokladnici
- * - POST /friday/admin/update-price { adminId, newPriceEur }
- *      → zmení FridaySupply.priceEur a prepíše cenu nepredaných tokenov (ownerId=null)
- */
-// POST /friday/admin/mint { adminId, quantity, priceEur }
-app.post("/friday/admin/mint", async (req, res) => {
-    try {
-        const { adminId, quantity, priceEur } = (req.body || {});
-        assertAdmin(adminId);
-        const qty = parsePositiveInt(quantity, "quantity");
-        const price = parsePrice(priceEur, "priceEur");
-        // 1) Upsert FridaySupply (globálne)
-        await prisma.fridaySupply.upsert({
-            where: { id: SUPPLY_ID },
-            update: {
-                totalMinted: { increment: qty },
-                priceEur: price,
-            },
-            create: {
-                id: SUPPLY_ID,
-                totalMinted: qty,
-                totalSold: 0,
-                priceEur: price,
-            },
-        });
-        // 2) Vytvoríme qty kusov FridayToken (bez ownera). ŽIADNE issuedYear.
-        const data = Array.from({ length: qty }, () => ({
-            ownerId: null,
-            minutesRemaining: 60,
-            status: "active",
-            originalPriceEur: price,
-        }));
-        const result = await prisma.fridayToken.createMany({ data });
-        return res.json({
-            success: true,
-            minted: result.count,
-            priceEur: price,
-            message: `Vygenerovaných ${result.count} tokenov s cenou ${price} €/ks.`,
-        });
-    }
-    catch (e) {
-        console.error("admin/mint error:", e);
-        return res.status(e.status ?? 500).json({ success: false, message: e.message ?? "Mint failed" });
-    }
-});
-// POST /friday/admin/update-price { adminId, newPriceEur }
-app.post("/friday/admin/update-price", async (req, res) => {
-    try {
-        const { adminId, newPriceEur } = (req.body || {});
-        assertAdmin(adminId);
-        const newPrice = parsePrice(newPriceEur, "newPriceEur");
-        // 1) FridaySupply (globálne) – nastav novú „primárnu“ cenu
-        await prisma.fridaySupply.upsert({
-            where: { id: SUPPLY_ID },
-            update: { priceEur: newPrice },
-            create: { id: SUPPLY_ID, totalMinted: 0, totalSold: 0, priceEur: newPrice },
-        });
-        // 2) Prepis ceny všetkých NEPREDANÝCH aktívnych tokenov (ownerId=null)
-        const upd = await prisma.fridayToken.updateMany({
-            where: { ownerId: null, status: "active" },
-            data: { originalPriceEur: newPrice },
-        });
-        return res.json({
-            success: true,
-            updatedUnsold: upd.count,
-            priceEur: newPrice,
-            message: `Cena nastavená na ${newPrice} € (upravených ${upd.count} nepredaných tokenov).`,
-        });
-    }
-    catch (e) {
-        console.error("admin/update-price error:", e);
-        return res.status(e.status ?? 500).json({ success: false, message: e.message ?? "Update price failed" });
-    }
-});
-// ===================== WebSocket & hovory (ponechané) ========================
+// WebSocket
 wss.on("connection", (ws) => {
     let currentUserId = null;
     // keepalive
@@ -342,37 +237,34 @@ wss.on("connection", (ws) => {
                                         const minutesLeft = await (0, db_1.fridayMinutes)(callerId);
                                         const caller = clients.get(callerId);
                                         if (caller?.ws && caller.ws.readyState === ws_1.default.OPEN) {
-                                            caller.ws.send(JSON.stringify({
-                                                type: "friday-balance-update",
-                                                minutesLeft,
-                                                deficit,
-                                            }));
+                                            caller.ws.send(JSON.stringify({ type: "friday-balance-update", minutesRemaining: minutesLeft }));
                                         }
-                                        if (deficit > 0) {
-                                            // ukonči hovor kvôli nedostatku tokenov
-                                            const t = clients.get(calleeId);
-                                            if (t?.ws && t.ws.readyState === ws_1.default.OPEN) {
-                                                t.ws.send(JSON.stringify({ type: "end-call", from: callerId }));
+                                        if (deficit > 0 || minutesLeft <= 0) {
+                                            const msg = JSON.stringify({ type: "end-call", reason: "no-friday-tokens" });
+                                            const callee = clients.get(calleeId);
+                                            try {
+                                                caller?.ws && caller.ws.readyState === ws_1.default.OPEN && caller.ws.send(msg);
                                             }
-                                            throw new Error("Insufficient Friday tokens");
+                                            catch { }
+                                            try {
+                                                callee?.ws && callee.ws.readyState === ws_1.default.OPEN && callee.ws.send(msg);
+                                            }
+                                            catch { }
+                                            const endedAt = new Date();
+                                            const secondsBilled = Math.ceil((endedAt.getTime() - session.startedAt.getTime()) / 1000);
+                                            const priceEur = (secondsBilled * PRICE_PER_SECOND).toFixed(2);
+                                            await prisma.callSession.update({
+                                                where: { id: session.id },
+                                                data: { endedAt, status: "no_tokens", secondsBilled, priceEur },
+                                            });
+                                            clearInterval(intervalId);
+                                            activeCalls.delete(key);
                                         }
                                     }
+                                    // mimo piatku: nič neúčtujeme
                                 }
                                 catch (e) {
-                                    // stop billing + ukonči session
-                                    clearInterval(intervalId);
-                                    const endedAt = new Date();
-                                    const secondsBilled = Math.ceil((endedAt.getTime() - session.startedAt.getTime()) / 1000);
-                                    const priceEur = (secondsBilled * PRICE_PER_SECOND).toFixed(2);
-                                    try {
-                                        await prisma.callSession.update({
-                                            where: { id: session.id },
-                                            data: { endedAt, status: "ended", secondsBilled, priceEur },
-                                        });
-                                    }
-                                    catch (err) {
-                                        console.error("finish callSession error:", err);
-                                    }
+                                    console.error("decrement/billing interval error:", e);
                                 }
                             }, 10000);
                             activeCalls.set(key, {
@@ -382,14 +274,18 @@ wss.on("connection", (ws) => {
                                 startedAt: session.startedAt,
                                 callSessionId: session.id,
                             });
+                            const callerEntry = clients.get(callerId);
+                            if (callerEntry?.ws && callerEntry.ws.readyState === ws_1.default.OPEN) {
+                                callerEntry.ws.send(JSON.stringify({ type: "call-started", from: calleeId }));
+                            }
                         }
                         catch (e) {
-                            console.error("start billing error:", e);
+                            console.error("callSession start error:", e);
                         }
                     }
                 }
             }
-            // ukončenie hovoru
+            // manuálne ukončenie hovoru
             if (data.type === "end-call") {
                 const target = clients.get(data.targetId);
                 if (target?.ws && target.ws.readyState === ws_1.default.OPEN) {
@@ -461,7 +357,7 @@ wss.on("connection", (ws) => {
     });
 });
 // WS keepalive
-setInterval(() => {
+const interval = setInterval(() => {
     wss.clients.forEach((ws) => {
         if (ws.isAlive === false)
             return ws.terminate();
@@ -472,6 +368,7 @@ setInterval(() => {
         catch { }
     });
 }, 30000);
+// Removed invalid wss "close" event listener; cleanup is handled by process signals below.
 // graceful shutdown
 process.on("SIGINT", async () => {
     await prisma.$disconnect();
