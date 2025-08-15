@@ -15,7 +15,7 @@ async function fridayMinutes(userId) {
 async function consumeFridaySeconds(userId, seconds) {
     const tokens = await prisma.fridayToken.findMany({
         where: { ownerId: userId, status: "active", minutesRemaining: { gt: 0 } },
-        orderBy: [{ issuedYear: "asc" }, { createdAt: "asc" }],
+        orderBy: { createdAt: "asc" }, // odstránený issuedYear
     });
     let restSec = seconds;
     for (const t of tokens) {
