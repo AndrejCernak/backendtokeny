@@ -46,6 +46,7 @@ const cors_1 = __importDefault(require("cors"));
 const firebase_admin_1 = __importDefault(require("./firebase-admin"));
 const client_1 = require("@prisma/client");
 const jose_1 = require("jose");
+const express_2 = require("@clerk/express");
 // Friday moduly
 const routes_1 = __importDefault(require("./friday/routes"));
 const config_1 = require("./friday/config");
@@ -162,6 +163,7 @@ app.post("/register-fcm", async (req, res) => {
         return res.status(500).json({ error: "Server error" });
     }
 });
+app.use((0, express_2.clerkMiddleware)());
 // Friday routes (obsahujú admin mint + set-price a zrušený mint-year)
 app.use("/", (0, routes_1.default)(prisma));
 // ───────────────────────────────────────────────────────────────────────────────
