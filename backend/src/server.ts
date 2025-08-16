@@ -86,7 +86,10 @@ app.post("/register-fcm", async (req, res) => {
   if (!userId || !fcmToken) return res.status(400).json({ error: "Missing userId or fcmToken" });
 
   try {
-    // pamäť (live WS routing)
+    // 1) Uisti sa, že existuje User (kvôli FK PushToken.userId -> User.id)
+    await ensureUser(userId);
+
+    // 2) Live routing pamäť
     if (!clients.has(userId)) clients.set(userId, { ws: null, fcmToken, role });
     else {
       const entry = clients.get(userId)!;
@@ -94,7 +97,7 @@ app.post("/register-fcm", async (req, res) => {
       if (role) entry.role = role;
     }
 
-    // DB persist (PushToken model)
+    // 3) Persist do DB
     await prisma.pushToken.upsert({
       where: { token: fcmToken },
       update: { userId, platform: platform || null },
@@ -102,11 +105,17 @@ app.post("/register-fcm", async (req, res) => {
     });
 
     return res.json({ success: true });
-  } catch (e) {
+  } catch (e: any) {
+    // voliteľne: špecifickejšia diagnostika
+    if (e.code === "P2003") {
+      console.error("register-fcm FK error: user neexistuje alebo nekonzistentné FK", e?.meta);
+      return res.status(400).json({ error: "Foreign key violation: userId must exist in User table" });
+    }
     console.error("register-fcm error:", e);
     return res.status(500).json({ error: "Server error" });
   }
 });
+
 
 // Friday routes mount
 app.use("/", fridayRoutes(prisma));
