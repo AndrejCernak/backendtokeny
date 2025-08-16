@@ -1,26 +1,33 @@
-// friday/config.ts
-export const FRIDAY_BASE_YEAR = Number(process.env.FRIDAY_BASE_YEAR || 2025);
-export const FRIDAY_BASE_PRICE_EUR = Number(process.env.FRIDAY_BASE_PRICE_EUR || 450);
-export const MAX_PRIMARY_TOKENS_PER_USER = Number(process.env.MAX_PRIMARY_TOKENS_PER_USER || 20);
+// friday/db.ts
+import { PrismaClient } from "@prisma/client";
+const prisma = new PrismaClient();
 
-export function priceForYear(year: number) {
-  const diff = year - FRIDAY_BASE_YEAR;
-  const price = FRIDAY_BASE_PRICE_EUR * Math.pow(1.1, diff);
-  return Math.round(price * 100) / 100;
+export async function fridayMinutes(userId: string) {
+  const tokens = await prisma.fridayToken.findMany({
+    where: { ownerId: userId, status: "active", minutesRemaining: { gt: 0 } },
+    select: { minutesRemaining: true },
+  });
+  return tokens.reduce((a, t) => a + t.minutesRemaining, 0);
 }
 
-export function isFridayInBratislava(now = new Date()) {
-  const local = new Date(now.toLocaleString("en-US", { timeZone: "Europe/Bratislava" }));
-  return local.getDay() === 5;
-}
+export async function consumeFridaySeconds(userId: string, seconds: number) {
+  const tokens = await prisma.fridayToken.findMany({
+    where: { ownerId: userId, status: "active", minutesRemaining: { gt: 0 } },
+    orderBy: [{ issuedYear: "asc" }, { createdAt: "asc" }],
+  });
 
-export function countFridaysInYear(year: number) {
-  let count = 0;
-  const d = new Date(Date.UTC(year, 0, 1));
-  while (d.getUTCFullYear() === year) {
-    const local = new Date(d.toLocaleString("en-US", { timeZone: "Europe/Bratislava" }));
-    if (local.getDay() === 5) count++;
-    d.setUTCDate(d.getUTCDate() + 1);
+  let restSec = seconds;
+  for (const t of tokens) {
+    if (restSec <= 0) break;
+    const tokenSec = t.minutesRemaining * 60;
+    const usedSec = Math.min(tokenSec, restSec);
+    const leftSec = tokenSec - usedSec;
+    const leftMin = Math.ceil(leftSec / 60);
+    await prisma.fridayToken.update({
+      where: { id: t.id },
+      data: { minutesRemaining: leftMin, status: leftMin <= 0 ? "spent" : "active" },
+    });
+    restSec -= usedSec;
   }
-  return count;
+  return restSec; // deficit ak > 0
 }

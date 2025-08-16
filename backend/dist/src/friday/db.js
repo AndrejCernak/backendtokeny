@@ -1,30 +1,35 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.MAX_PRIMARY_TOKENS_PER_USER = exports.FRIDAY_BASE_PRICE_EUR = exports.FRIDAY_BASE_YEAR = void 0;
-exports.priceForYear = priceForYear;
-exports.isFridayInBratislava = isFridayInBratislava;
-exports.countFridaysInYear = countFridaysInYear;
-// friday/config.ts
-exports.FRIDAY_BASE_YEAR = Number(process.env.FRIDAY_BASE_YEAR || 2025);
-exports.FRIDAY_BASE_PRICE_EUR = Number(process.env.FRIDAY_BASE_PRICE_EUR || 450);
-exports.MAX_PRIMARY_TOKENS_PER_USER = Number(process.env.MAX_PRIMARY_TOKENS_PER_USER || 20);
-function priceForYear(year) {
-    const diff = year - exports.FRIDAY_BASE_YEAR;
-    const price = exports.FRIDAY_BASE_PRICE_EUR * Math.pow(1.1, diff);
-    return Math.round(price * 100) / 100;
+exports.fridayMinutes = fridayMinutes;
+exports.consumeFridaySeconds = consumeFridaySeconds;
+// friday/db.ts
+const client_1 = require("@prisma/client");
+const prisma = new client_1.PrismaClient();
+async function fridayMinutes(userId) {
+    const tokens = await prisma.fridayToken.findMany({
+        where: { ownerId: userId, status: "active", minutesRemaining: { gt: 0 } },
+        select: { minutesRemaining: true },
+    });
+    return tokens.reduce((a, t) => a + t.minutesRemaining, 0);
 }
-function isFridayInBratislava(now = new Date()) {
-    const local = new Date(now.toLocaleString("en-US", { timeZone: "Europe/Bratislava" }));
-    return local.getDay() === 5;
-}
-function countFridaysInYear(year) {
-    let count = 0;
-    const d = new Date(Date.UTC(year, 0, 1));
-    while (d.getUTCFullYear() === year) {
-        const local = new Date(d.toLocaleString("en-US", { timeZone: "Europe/Bratislava" }));
-        if (local.getDay() === 5)
-            count++;
-        d.setUTCDate(d.getUTCDate() + 1);
+async function consumeFridaySeconds(userId, seconds) {
+    const tokens = await prisma.fridayToken.findMany({
+        where: { ownerId: userId, status: "active", minutesRemaining: { gt: 0 } },
+        orderBy: [{ issuedYear: "asc" }, { createdAt: "asc" }],
+    });
+    let restSec = seconds;
+    for (const t of tokens) {
+        if (restSec <= 0)
+            break;
+        const tokenSec = t.minutesRemaining * 60;
+        const usedSec = Math.min(tokenSec, restSec);
+        const leftSec = tokenSec - usedSec;
+        const leftMin = Math.ceil(leftSec / 60);
+        await prisma.fridayToken.update({
+            where: { id: t.id },
+            data: { minutesRemaining: leftMin, status: leftMin <= 0 ? "spent" : "active" },
+        });
+        restSec -= usedSec;
     }
-    return count;
+    return restSec; // deficit ak > 0
 }
