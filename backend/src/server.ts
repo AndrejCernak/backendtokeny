@@ -6,11 +6,7 @@ import http from "http";
 import cors from "cors";
 import admin from "./firebase-admin";
 import { PrismaClient } from "@prisma/client";
-
-// Friday moduly
-import fridayRoutes from "./friday/routes";
-import { isFridayInBratislava } from "./friday/config";
-import { fridayMinutes, consumeFridaySeconds } from "./friday/db";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 
 // ───────────────────────────────────────────────────────────────────────────────
 // Typová rozšírenina pre ws (keepalive)
@@ -20,13 +16,18 @@ declare module "ws" {
   }
 }
 
+// Friday moduly
+import fridayRoutes from "./friday/routes";
+import { isFridayInBratislava } from "./friday/config";
+import { fridayMinutes, consumeFridaySeconds } from "./friday/db";
+
 // ───────────────────────────────────────────────────────────────────────────────
 // Inicializácie
 const prisma = new PrismaClient();
 const app = express();
 app.use(express.json());
 
-// CORS (doplň sem svoje FE domény podľa potreby)
+// CORS
 const allowedOrigins = [
   "https://frontendtokeny.vercel.app",
   "https://frontendtokeny-42hveafvm-andrejcernaks-projects.vercel.app",
@@ -47,6 +48,32 @@ app.use(
 // HTTP + WS server
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Clerk JWT overenie cez jose (JWKS)
+const ISSUER = process.env.CLERK_ISSUER; // napr. https://your-subdomain.clerk.accounts.dev
+if (!ISSUER) {
+  console.warn("⚠️  Missing CLERK_ISSUER in env!");
+}
+const JWKS = ISSUER
+  ? createRemoteJWKSet(new URL(`${ISSUER}/.well-known/jwks.json`))
+  : null;
+
+async function getUserIdFromAuthHeader(req: express.Request): Promise<string | null> {
+  try {
+    const auth = req.header("authorization") || req.header("Authorization");
+    if (!auth?.startsWith("Bearer ")) return null;
+    const token = auth.slice("Bearer ".length);
+    if (!JWKS || !ISSUER) return null;
+
+    const { payload } = await jwtVerify(token, JWKS, { issuer: ISSUER });
+    // Clerk user ID býva v `sub`
+    return (payload.sub as string) || null;
+  } catch (e) {
+    console.error("JWT verify error:", e);
+    return null;
+  }
+}
 
 // ───────────────────────────────────────────────────────────────────────────────
 // Pomocné štruktúry pre WS
@@ -77,13 +104,12 @@ async function ensureUser(userId: string) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// REST ROUTES (bez akéhokoľvek auth)
+// REST ROUTES
 
-// 1) Sync usera – teraz berie userId z BODY (bez JWT)
+// 1) Po prihlásení z FE zavolaj → upsertne usera (žiadne FK pády potom)
 app.post("/sync-user", async (req, res) => {
-  const { userId } = (req.body || {}) as { userId?: string };
-  if (!userId) return res.status(400).json({ error: "Missing userId" });
-
+  const userId = await getUserIdFromAuthHeader(req);
+  if (!userId) return res.status(401).json({ error: "Unauthenticated" });
   try {
     await ensureUser(userId);
     return res.json({ ok: true });
@@ -93,21 +119,21 @@ app.post("/sync-user", async (req, res) => {
   }
 });
 
-// 2) Registrácia/aktualizácia FCM tokenu – teraz berie userId z BODY (bez JWT)
+// 2) Registrácia/aktualizácia FCM tokenu pre aktuálneho (overeného) usera
 app.post("/register-fcm", async (req, res) => {
+  const userId = await getUserIdFromAuthHeader(req);
+  if (!userId) return res.status(401).json({ error: "Unauthenticated" });
+
   const body = (req.body || {}) as {
-    userId?: string;
     fcmToken?: string;
     role?: Role;
     platform?: string;
   };
-  const { userId, fcmToken, role, platform } = body;
-
-  if (!userId) return res.status(400).json({ error: "Missing userId" });
+  const { fcmToken, role, platform } = body;
   if (!fcmToken) return res.status(400).json({ error: "Missing fcmToken" });
 
   try {
-    // a) istota, že User existuje
+    // a) istota, že User existuje (fix FK P2003)
     await ensureUser(userId);
 
     // b) cache pre WS
@@ -132,7 +158,7 @@ app.post("/register-fcm", async (req, res) => {
   }
 });
 
-// Friday routes (NEPOUŽÍVAJTE v nich ensureAdmin, keď chcete „bez overovania“)
+// Friday routes
 app.use("/", fridayRoutes(prisma));
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -423,15 +449,11 @@ process.on("SIGTERM", async () => {
   process.exit(0);
 });
 
-// ensure admin (ak si to niekde používal – teraz je to zbytočné, nechávam len aby DB mala záznam)
+// ensure admin (ak používaš ADMIN_ID)
 (async () => {
   const ADMIN_ID = process.env.ADMIN_ID;
   if (ADMIN_ID) {
-    try {
-      await ensureUser(ADMIN_ID);
-    } catch (e) {
-      console.error("ensure admin error:", e);
-    }
+    try { await ensureUser(ADMIN_ID); } catch (e) { console.error("ensure admin error:", e); }
   }
 })();
 
