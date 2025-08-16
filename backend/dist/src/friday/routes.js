@@ -128,9 +128,7 @@ function fridayRoutes(prisma) {
         try {
             const { userId, quantity, year } = (req.body || {});
             if (!userId || !Number.isInteger(quantity) || quantity <= 0) {
-                return res
-                    .status(400)
-                    .json({ success: false, message: "Missing or invalid userId/quantity" });
+                return res.status(400).json({ success: false, message: "Missing or invalid userId/quantity" });
             }
             await ensureUser(userId);
             const settings = await ensureSettings();
@@ -152,19 +150,16 @@ function fridayRoutes(prisma) {
                 where: { ownerId: null, issuedYear: y, status: "active" },
                 take: quantity,
                 select: { id: true },
+                orderBy: { createdAt: "asc" }, // deterministické
             });
             if (available.length < quantity) {
-                return res
-                    .status(400)
-                    .json({ success: false, message: "Not enough tokens in treasury" });
+                return res.status(400).json({ success: false, message: "Not enough tokens in treasury" });
             }
             const amountEur = unitPrice * quantity;
+            const purchasedTokenIds = available.map(a => a.id);
             await prisma.$transaction(async (tx) => {
-                await tx.fridayToken.updateMany({
-                    where: { id: { in: available.map((a) => a.id) } },
-                    data: { ownerId: userId },
-                });
-                await tx.transaction.create({
+                // 1) zapíš transakciu
+                const tr = await tx.transaction.create({
                     data: {
                         userId,
                         type: "friday_purchase",
@@ -173,7 +168,27 @@ function fridayRoutes(prisma) {
                         note: `friday:${y}; qty:${quantity}; unit:${unitPrice}`,
                     },
                 });
+                // 2) priraď tokeny používateľovi
+                await tx.fridayToken.updateMany({
+                    where: { id: { in: purchasedTokenIds } },
+                    data: { ownerId: userId },
+                });
+                // 3) položky nákupu – 1 riadok na každý token (kvôli auditovateľnosti)
+                await tx.fridayPurchaseItem.createMany({
+                    data: purchasedTokenIds.map((tokenId) => ({
+                        transactionId: tr.id,
+                        tokenId,
+                        priceEur: unitPrice,
+                    })),
+                    skipDuplicates: true,
+                });
+                // 4) (voliteľné) zvýš predaj v FridaySupply
+                await tx.fridaySupply.updateMany({
+                    where: { year: y },
+                    data: { totalSold: { increment: quantity } },
+                });
             });
+            // odpoveď – ako doteraz + pridáme purchasedTokenIds
             const tokens = await prisma.fridayToken.findMany({
                 where: { ownerId: userId },
                 select: { id: true, issuedYear: true, minutesRemaining: true, status: true },
@@ -182,7 +197,15 @@ function fridayRoutes(prisma) {
             const totalMinutes = tokens
                 .filter((t) => t.status === "active")
                 .reduce((a, t) => a + t.minutesRemaining, 0);
-            return res.json({ success: true, year: y, unitPrice, quantity, totalMinutes, tokens });
+            return res.json({
+                success: true,
+                year: y,
+                unitPrice,
+                quantity,
+                purchasedTokenIds, // <— TU máš presne ID zakúpených tokenov
+                totalMinutes,
+                tokens,
+            });
         }
         catch (e) {
             console.error("POST /friday/purchase", e);

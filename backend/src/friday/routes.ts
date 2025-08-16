@@ -137,84 +137,111 @@ export default function fridayRoutes(prisma: PrismaClient) {
     }
   });
 
-  // Purchase
-  router.post("/friday/purchase", async (req: Request, res: Response) => {
-    try {
-      const { userId, quantity, year } = (req.body || {}) as {
-        userId?: string;
-        quantity?: number;
-        year?: number | string;
-      };
+ // Purchase
+router.post("/friday/purchase", async (req: Request, res: Response) => {
+  try {
+    const { userId, quantity, year } = (req.body || {}) as {
+      userId?: string;
+      quantity?: number;
+      year?: number | string;
+    };
 
-      if (!userId || !Number.isInteger(quantity) || (quantity as number) <= 0) {
-        return res
-          .status(400)
-          .json({ success: false, message: "Missing or invalid userId/quantity" });
-      }
-      await ensureUser(userId);
-
-      const settings = await ensureSettings();
-      const unitPrice = Number(settings?.currentPriceEur || 0);
-      if (unitPrice <= 0) {
-        return res.status(400).json({ success: false, message: "Treasury price not set" });
-      }
-
-      const y = Number(year) || new Date().getFullYear();
-
-      const ownedThisYear = await prisma.fridayToken.count({
-        where: { ownerId: userId, issuedYear: y, status: { in: ["active", "listed"] } },
-      });
-      if (ownedThisYear + (quantity as number) > MAX_PRIMARY_TOKENS_PER_USER) {
-        return res.status(400).json({
-          success: false,
-          message: `Primary limit is ${MAX_PRIMARY_TOKENS_PER_USER} tokens per user for year ${y}`,
-        });
-      }
-
-      const available = await prisma.fridayToken.findMany({
-        where: { ownerId: null, issuedYear: y, status: "active" },
-        take: quantity,
-        select: { id: true },
-      });
-      if (available.length < (quantity as number)) {
-        return res
-          .status(400)
-          .json({ success: false, message: "Not enough tokens in treasury" });
-      }
-
-      const amountEur = unitPrice * (quantity as number);
-
-      await prisma.$transaction(async (tx) => {
-        await tx.fridayToken.updateMany({
-          where: { id: { in: available.map((a) => a.id) } },
-          data: { ownerId: userId },
-        });
-        await tx.transaction.create({
-          data: {
-            userId,
-            type: "friday_purchase",
-            amountEur,
-            secondsDelta: 0,
-            note: `friday:${y}; qty:${quantity}; unit:${unitPrice}`,
-          },
-        });
-      });
-
-      const tokens = await prisma.fridayToken.findMany({
-        where: { ownerId: userId },
-        select: { id: true, issuedYear: true, minutesRemaining: true, status: true },
-        orderBy: [{ issuedYear: "asc" }, { createdAt: "asc" }],
-      });
-      const totalMinutes = tokens
-        .filter((t) => t.status === "active")
-        .reduce((a, t) => a + t.minutesRemaining, 0);
-
-      return res.json({ success: true, year: y, unitPrice, quantity, totalMinutes, tokens });
-    } catch (e) {
-      console.error("POST /friday/purchase", e);
-      return res.status(500).json({ success: false, message: "Server error" });
+    if (!userId || !Number.isInteger(quantity) || (quantity as number) <= 0) {
+      return res.status(400).json({ success: false, message: "Missing or invalid userId/quantity" });
     }
-  });
+    await ensureUser(userId);
+
+    const settings = await ensureSettings();
+    const unitPrice = Number(settings?.currentPriceEur || 0);
+    if (unitPrice <= 0) {
+      return res.status(400).json({ success: false, message: "Treasury price not set" });
+    }
+
+    const y = Number(year) || new Date().getFullYear();
+
+    const ownedThisYear = await prisma.fridayToken.count({
+      where: { ownerId: userId, issuedYear: y, status: { in: ["active", "listed"] } },
+    });
+    if (ownedThisYear + (quantity as number) > MAX_PRIMARY_TOKENS_PER_USER) {
+      return res.status(400).json({
+        success: false,
+        message: `Primary limit is ${MAX_PRIMARY_TOKENS_PER_USER} tokens per user for year ${y}`,
+      });
+    }
+
+    const available = await prisma.fridayToken.findMany({
+      where: { ownerId: null, issuedYear: y, status: "active" },
+      take: quantity,
+      select: { id: true },
+      orderBy: { createdAt: "asc" }, // deterministické
+    });
+    if (available.length < (quantity as number)) {
+      return res.status(400).json({ success: false, message: "Not enough tokens in treasury" });
+    }
+
+    const amountEur = unitPrice * (quantity as number);
+    const purchasedTokenIds = available.map(a => a.id);
+
+    await prisma.$transaction(async (tx) => {
+      // 1) zapíš transakciu
+      const tr = await tx.transaction.create({
+        data: {
+          userId,
+          type: "friday_purchase",
+          amountEur,
+          secondsDelta: 0,
+          note: `friday:${y}; qty:${quantity}; unit:${unitPrice}`,
+        },
+      });
+
+      // 2) priraď tokeny používateľovi
+      await tx.fridayToken.updateMany({
+        where: { id: { in: purchasedTokenIds } },
+        data: { ownerId: userId },
+      });
+
+      // 3) položky nákupu – 1 riadok na každý token (kvôli auditovateľnosti)
+      await tx.fridayPurchaseItem.createMany({
+        data: purchasedTokenIds.map((tokenId) => ({
+          transactionId: tr.id,
+          tokenId,
+          priceEur: unitPrice,
+        })),
+        skipDuplicates: true,
+      });
+
+      // 4) (voliteľné) zvýš predaj v FridaySupply
+      await tx.fridaySupply.updateMany({
+        where: { year: y },
+        data: { totalSold: { increment: quantity as number } },
+      });
+    });
+
+    // odpoveď – ako doteraz + pridáme purchasedTokenIds
+    const tokens = await prisma.fridayToken.findMany({
+      where: { ownerId: userId },
+      select: { id: true, issuedYear: true, minutesRemaining: true, status: true },
+      orderBy: [{ issuedYear: "asc" }, { createdAt: "asc" }],
+    });
+    const totalMinutes = tokens
+      .filter((t) => t.status === "active")
+      .reduce((a, t) => a + t.minutesRemaining, 0);
+
+    return res.json({
+      success: true,
+      year: y,
+      unitPrice,
+      quantity,
+      purchasedTokenIds,       // <— TU máš presne ID zakúpených tokenov
+      totalMinutes,
+      tokens,
+    });
+  } catch (e) {
+    console.error("POST /friday/purchase", e);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
 
   // Listings
   router.post("/friday/list", async (req: Request, res: Response) => {

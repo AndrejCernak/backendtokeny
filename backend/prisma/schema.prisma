@@ -43,6 +43,7 @@ model TokenBalance {
  * secondsDelta používame pre „bežný kredit“ (mimo piatku).
  * Piatkové nákupy/obchody evidujeme cez Friday* typy.
  */
+// Transaction – doplň spätnú väzbu
 model Transaction {
   id           String           @id @default(cuid())
   userId       String
@@ -54,9 +55,27 @@ model Transaction {
 
   user         User             @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  // NEW
+  fridayPurchaseItems FridayPurchaseItem[]
+
   @@index([userId, createdAt])
   @@index([type, createdAt])
 }
+
+model FridayPurchaseItem {
+  id            String        @id @default(cuid())
+  transactionId String
+  tokenId       String        @unique
+  priceEur      Decimal       @db.Decimal(10, 2)
+  createdAt     DateTime      @default(now())
+
+  transaction   Transaction   @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  token         FridayToken   @relation("TokenPurchaseItems", fields: [tokenId], references: [id], onDelete: Cascade)
+
+  @@index([transactionId])
+}
+
+
 
 enum TransactionType {
   // legacy / mimo piatku
@@ -115,16 +134,17 @@ model FridayToken {
   createdAt        DateTime           @default(now())
   originalPriceEur Decimal            @db.Decimal(10, 2)
 
-  // väzba na User (pomenovaná relácia + spätné pole v User.fridayTokens)
   owner            User?              @relation("UserFridayTokens", fields: [ownerId], references: [id], onDelete: SetNull)
-
-  // spätné pole k FridayListing.token (1:1, tokenId je unique)
   listing          FridayListing?     @relation("TokenListing")
+
+  // NEW: spätná väzba na položky nákupu
+  purchaseItems    FridayPurchaseItem[] @relation("TokenPurchaseItems")
 
   @@index([ownerId])
   @@index([issuedYear])
   @@index([status])
 }
+
 
 enum FridayTokenStatus {
   active
