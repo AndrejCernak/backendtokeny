@@ -272,11 +272,6 @@ function fridayRoutes(prisma) {
                     })),
                     skipDuplicates: true,
                 });
-                // 4) (voliteľné) zvýš predaj v FridaySupply
-                await tx.fridaySupply.updateMany({
-                    where: { year: y },
-                    data: { totalSold: { increment: quantity } },
-                });
             });
             // odpoveď – ako doteraz + pridáme purchasedTokenIds
             const tokens = await prisma.fridayToken.findMany({

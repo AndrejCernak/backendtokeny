@@ -13,7 +13,6 @@ model User {
   id                   String           @id
   createdAt            DateTime         @default(now())
 
-  tokenBalance         TokenBalance?
   transactions         Transaction[]
   callSessionsAsCaller CallSession[]    @relation("CallerSessions")
   callSessionsAsCallee CallSession[]    @relation("CalleeSessions")
@@ -31,16 +30,6 @@ model User {
   pushTokens           PushToken[]
 }
 
-/**
- * Bežný kredit (mimo piatku) v sekundách (zostáva kvôli starej logike)
- */
-model TokenBalance {
-  userId           String   @id
-  secondsRemaining Int      @default(0)
-  updatedAt        DateTime @updatedAt
-
-  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-}
 
 /**
  * Finančno-kreditné pohyby.
@@ -156,16 +145,6 @@ enum FridayTokenStatus {
   listed
 }
 
-/**
- * Evidencia emisie v danom roku (treasury).
- */
-model FridaySupply {
-  year        Int      @id
-  totalMinted Int
-  totalSold   Int      @default(0)
-  priceEur    Decimal  @db.Decimal(10, 2)
-  createdAt   DateTime @default(now())
-}
 
 /**
  * Sekundárny trh – listing jedného konkrétneho tokenu.

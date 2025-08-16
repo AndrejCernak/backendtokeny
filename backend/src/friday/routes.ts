@@ -307,13 +307,9 @@ router.post("/friday/purchase", async (req: Request, res: Response) => {
         })),
         skipDuplicates: true,
       });
-
-      // 4) (voliteľné) zvýš predaj v FridaySupply
-      await tx.fridaySupply.updateMany({
-        where: { year: y },
-        data: { totalSold: { increment: quantity as number } },
-      });
     });
+
+   
 
     // odpoveď – ako doteraz + pridáme purchasedTokenIds
     const tokens = await prisma.fridayToken.findMany({
