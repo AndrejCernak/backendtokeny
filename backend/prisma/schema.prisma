@@ -10,21 +10,25 @@ generator client {
 
 // ===== User & Legacy Credit (seconds) =====
 model User {
-  id                   String         @id
-  createdAt            DateTime       @default(now())
+  id                   String           @id
+  createdAt            DateTime         @default(now())
 
   tokenBalance         TokenBalance?
   transactions         Transaction[]
-  callSessionsAsCaller CallSession[]  @relation("CallerSessions")
-  callSessionsAsCallee CallSession[]  @relation("CalleeSessions")
+  callSessionsAsCaller CallSession[]    @relation("CallerSessions")
+  callSessionsAsCallee CallSession[]    @relation("CalleeSessions")
 
   // spätné pole k FridayToken.owner
-  fridayTokens         FridayToken[]  @relation("UserFridayTokens")
+  fridayTokens         FridayToken[]    @relation("UserFridayTokens")
 
   // spätné pole k FridayListing.seller
-  tokenListings        FridayListing[] @relation("SellerListings")
-  pushTokens           PushToken[]
+  tokenListings        FridayListing[]  @relation("SellerListings")
 
+  // sekundárne obchody
+  tradesSold           FridayTrade[]    @relation("TradesAsSeller")
+  tradesBought         FridayTrade[]    @relation("TradesAsBuyer")
+
+  pushTokens           PushToken[]
 }
 
 /**
@@ -43,19 +47,18 @@ model TokenBalance {
  * secondsDelta používame pre „bežný kredit“ (mimo piatku).
  * Piatkové nákupy/obchody evidujeme cez Friday* typy.
  */
-// Transaction – doplň spätnú väzbu
 model Transaction {
-  id           String           @id @default(cuid())
+  id           String               @id @default(cuid())
   userId       String
   type         TransactionType
-  amountEur    Decimal          @db.Decimal(10, 2) @default(0)
-  secondsDelta Int              @default(0)
+  amountEur    Decimal              @db.Decimal(10, 2) @default(0)
+  secondsDelta Int                  @default(0)
   note         String?
-  createdAt    DateTime         @default(now())
+  createdAt    DateTime             @default(now())
 
-  user         User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user         User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  // NEW
+  // primárny nákup – položky (1 token = 1 riadok)
   fridayPurchaseItems FridayPurchaseItem[]
 
   @@index([userId, createdAt])
@@ -74,8 +77,6 @@ model FridayPurchaseItem {
 
   @@index([transactionId])
 }
-
-
 
 enum TransactionType {
   // legacy / mimo piatku
@@ -120,31 +121,34 @@ enum CallStatus {
   no_tokens
 }
 
-// ===== Friday Tokens (Alternatíva A) =====
+// ===== Friday Tokens =====
 
 /**
  * Jeden piatkový token = 60 min. Prenositeľný (burza).
  */
 model FridayToken {
-  id               String             @id @default(cuid())
+  id               String               @id @default(cuid())
   ownerId          String?
   issuedYear       Int
-  minutesRemaining Int                @default(60)
-  status           FridayTokenStatus  @default(active)
-  createdAt        DateTime           @default(now())
-  originalPriceEur Decimal            @db.Decimal(10, 2)
+  minutesRemaining Int                  @default(60)
+  status           FridayTokenStatus    @default(active)
+  createdAt        DateTime             @default(now())
+  originalPriceEur Decimal              @db.Decimal(10, 2)
 
-  owner            User?              @relation("UserFridayTokens", fields: [ownerId], references: [id], onDelete: SetNull)
-  listing          FridayListing?     @relation("TokenListing")
+  // väzby
+  owner            User?                @relation("UserFridayTokens", fields: [ownerId], references: [id], onDelete: SetNull)
+  listing          FridayListing?       @relation("TokenListing")
 
-  // NEW: spätná väzba na položky nákupu
+  // primárny nákup – spätná väzba
   purchaseItems    FridayPurchaseItem[] @relation("TokenPurchaseItems")
+
+  // sekundárne obchody – spätná väzba
+  trades           FridayTrade[]        @relation("TokenTrades")
 
   @@index([ownerId])
   @@index([issuedYear])
   @@index([status])
 }
-
 
 enum FridayTokenStatus {
   active
@@ -190,11 +194,31 @@ enum ListingStatus {
   cancelled
 }
 
+// ===== Sekundárne obchody (história) =====
+model FridayTrade {
+  id             String   @id @default(cuid())
+  listingId      String   @unique
+  tokenId        String
+  sellerId       String
+  buyerId        String
+  priceEur       Decimal  @db.Decimal(10, 2)
+  platformFeeEur Decimal  @db.Decimal(10, 2) @default(0)
+  createdAt      DateTime @default(now())
+
+  token   FridayToken @relation("TokenTrades",   fields: [tokenId],  references: [id], onDelete: Cascade)
+  seller  User        @relation("TradesAsSeller", fields: [sellerId], references: [id], onDelete: Cascade)
+  buyer   User        @relation("TradesAsBuyer",  fields: [buyerId],  references: [id], onDelete: Cascade)
+
+  @@index([tokenId, createdAt])
+  @@index([sellerId, createdAt])
+  @@index([buyerId, createdAt])
+}
+
 model PushToken {
   id        String   @id @default(cuid())
   userId    String
   token     String   @unique           // FCM token (jedinečný)
-  platform  String?                     // napr. "ios", "android", "web"
+  platform  String?                    // napr. "ios", "android", "web"
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -203,7 +227,7 @@ model PushToken {
   @@index([userId])
 }
 
-// ➕ PRIDAJ do schema.prisma
+// Nastavenia pokladnice (cena)
 model FridaySettings {
   id              Int      @id @default(1)
   currentPriceEur Decimal  @db.Decimal(10, 2) @default(0)

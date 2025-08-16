@@ -6,6 +6,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.default = fridayRoutes;
 // src/friday/routes.ts
 const express_1 = __importDefault(require("express"));
+const client_1 = require("@prisma/client");
 const config_1 = require("./config");
 function fridayRoutes(prisma) {
     const router = express_1.default.Router();
@@ -81,6 +82,95 @@ function fridayRoutes(prisma) {
         catch (e) {
             console.error("POST /friday/admin/set-price", e);
             return res.status(500).json({ success: false, message: "Server error" });
+        }
+    });
+    // Kúpa z burzy (sekundárny obchod)
+    router.post("/friday/buy-listing", async (req, res) => {
+        const { buyerId, listingId } = (req.body || {});
+        if (!buyerId || !listingId) {
+            return res.status(400).json({ success: false, message: "Missing buyerId/listingId" });
+        }
+        try {
+            await ensureUser(buyerId);
+            const result = await prisma.$transaction(async (tx) => {
+                // 1) načítaj listing + token
+                const listing = await tx.fridayListing.findUnique({
+                    where: { id: listingId },
+                    include: { token: true },
+                });
+                if (!listing || listing.status !== "open")
+                    throw new Error("Listing nie je dostupný");
+                if (listing.sellerId === buyerId)
+                    throw new Error("Nemôžeš kúpiť vlastný listing");
+                // 2) limit 20/rok aj pre sekundárny nákup (ak nechceš, vyhoď tento blok)
+                const ownedThisYear = await tx.fridayToken.count({
+                    where: {
+                        ownerId: buyerId,
+                        issuedYear: listing.token.issuedYear,
+                        status: { in: ["active", "listed"] },
+                    },
+                });
+                if (ownedThisYear >= 20) {
+                    throw new Error(`Limit 20 tokenov pre rok ${listing.token.issuedYear} dosiahnutý`);
+                }
+                // 3) „lockni“ listing (optimisticky)
+                const locked = await tx.fridayListing.updateMany({
+                    where: { id: listing.id, status: "open" },
+                    data: { status: "sold", closedAt: new Date() },
+                });
+                if (locked.count !== 1)
+                    throw new Error("Listing už bol uzavretý");
+                // 4) over token (je stále u predajcu a v stave listed)
+                const tok = await tx.fridayToken.findUnique({
+                    where: { id: listing.tokenId },
+                    select: { ownerId: true, status: true, minutesRemaining: true },
+                });
+                if (!tok || tok.ownerId !== listing.sellerId || tok.status !== "listed" || (tok.minutesRemaining ?? 0) <= 0) {
+                    throw new Error("Token nie je možné kúpiť");
+                }
+                // 5) prehoď vlastníka tokenu späť na active
+                await tx.fridayToken.update({
+                    where: { id: listing.tokenId },
+                    data: { ownerId: buyerId, status: "active" },
+                });
+                // 6) zapíš obchod
+                const platformFeeEur = new client_1.Prisma.Decimal(0);
+                const trade = await tx.fridayTrade.create({
+                    data: {
+                        listingId: listing.id,
+                        tokenId: listing.tokenId,
+                        sellerId: listing.sellerId,
+                        buyerId,
+                        priceEur: listing.priceEur,
+                        platformFeeEur,
+                    },
+                });
+                // 7) transakčné záznamy (buy/sell)
+                await tx.transaction.createMany({
+                    data: [
+                        {
+                            userId: buyerId,
+                            type: "friday_trade_buy",
+                            amountEur: listing.priceEur,
+                            secondsDelta: 0,
+                            note: `listing:${listing.id}; token:${listing.tokenId}`,
+                        },
+                        {
+                            userId: listing.sellerId,
+                            type: "friday_trade_sell",
+                            amountEur: listing.priceEur, // prípadne odpočítaj fee
+                            secondsDelta: 0,
+                            note: `listing:${listing.id}; token:${listing.tokenId}`,
+                        },
+                    ],
+                });
+                return { tradeId: trade.id, tokenId: listing.tokenId, priceEur: listing.priceEur };
+            });
+            return res.json({ success: true, ...result });
+        }
+        catch (e) {
+            console.error("POST /friday/buy-listing", e);
+            return res.status(400).json({ success: false, message: e.message || "Buy failed" });
         }
     });
     // Supply
