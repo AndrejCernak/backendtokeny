@@ -182,3 +182,10 @@ model PushToken {
 
   @@index([userId])
 }
+
+// ➕ PRIDAJ do schema.prisma
+model FridaySettings {
+  id              Int      @id @default(1)
+  currentPriceEur Decimal  @db.Decimal(10, 2) @default(0)
+  updatedAt       DateTime @updatedAt
+}

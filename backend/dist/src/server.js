@@ -36,6 +36,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.getUserIdFromAuthHeader = getUserIdFromAuthHeader;
 // server.ts
 require("dotenv/config");
 const express_1 = __importDefault(require("express"));
@@ -82,6 +83,7 @@ if (!ISSUER) {
 const JWKS = ISSUER
     ? (0, jose_1.createRemoteJWKSet)(new URL(`${ISSUER}/.well-known/jwks.json`))
     : null;
+// ➕ Exportovateľná helper funkcia pre routes/middleware
 async function getUserIdFromAuthHeader(req) {
     try {
         const auth = req.header("authorization") || req.header("Authorization");
@@ -160,7 +162,7 @@ app.post("/register-fcm", async (req, res) => {
         return res.status(500).json({ error: "Server error" });
     }
 });
-// Friday routes
+// Friday routes (obsahujú admin mint + set-price a zrušený mint-year)
 app.use("/", (0, routes_1.default)(prisma));
 // ───────────────────────────────────────────────────────────────────────────────
 // WEBSOCKET

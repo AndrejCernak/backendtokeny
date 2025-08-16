@@ -59,7 +59,8 @@ const JWKS = ISSUER
   ? createRemoteJWKSet(new URL(`${ISSUER}/.well-known/jwks.json`))
   : null;
 
-async function getUserIdFromAuthHeader(req: express.Request): Promise<string | null> {
+// ➕ Exportovateľná helper funkcia pre routes/middleware
+export async function getUserIdFromAuthHeader(req: express.Request): Promise<string | null> {
   try {
     const auth = req.header("authorization") || req.header("Authorization");
     if (!auth?.startsWith("Bearer ")) return null;
@@ -158,7 +159,7 @@ app.post("/register-fcm", async (req, res) => {
   }
 });
 
-// Friday routes
+// Friday routes (obsahujú admin mint + set-price a zrušený mint-year)
 app.use("/", fridayRoutes(prisma));
 
 // ───────────────────────────────────────────────────────────────────────────────
