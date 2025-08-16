@@ -31,54 +31,62 @@ function fridayRoutes(prisma) {
     // ───────────────────────────────────────────────────────────────────────────
     // ❌ Pôvodný "mint-year" endpoint sa už NEPOUŽÍVA – odstránený
     // ✅ ADMIN: Mint ľubovoľného počtu tokenov s cenou (a prípadným rokom)
+    // ✅ ADMIN: Mint + nastav currentPriceEur
     router.post("/friday/admin/mint", admin_1.ensureAdmin, async (req, res) => {
         try {
-            const { quantity, priceEur, year } = (req.body || {});
+            const { quantity, priceEur } = req.body;
             const qty = Number(quantity);
             const price = Number(priceEur);
-            const y = Number(year) || new Date().getFullYear();
+            const year = new Date().getFullYear();
             if (!Number.isInteger(qty) || qty <= 0 || !Number.isFinite(price) || price <= 0) {
-                return res.status(400).json({ success: false, message: "Invalid quantity or priceEur" });
+                return res.status(400).json({ success: false, message: "Invalid quantity/priceEur" });
             }
             await prisma.$transaction(async (tx) => {
-                // vytvor N tokenov v pokladnici (ownerId = null)
-                const batch = Array.from({ length: qty }, () => ({
-                    issuedYear: y,
-                    ownerId: null,
-                    minutesRemaining: 60,
-                    status: "active",
-                    originalPriceEur: price,
-                }));
-                const CHUNK = 1000;
-                for (let i = 0; i < batch.length; i += CHUNK) {
-                    await tx.fridayToken.createMany({ data: batch.slice(i, i + CHUNK) });
-                }
-                // nastav/aktualizuj aktuálnu cenu v pokladnici
+                // vytvor N tokenov v pokladnici
+                await tx.fridayToken.createMany({
+                    data: Array.from({ length: qty }, () => ({
+                        minutesRemaining: 60,
+                        status: "active",
+                        originalPriceEur: price,
+                        issuedYear: year,
+                    })),
+                });
+                // zároveň nastav aktuálnu pokladničnú cenu
                 await tx.fridaySettings.upsert({
                     where: { id: 1 },
                     update: { currentPriceEur: price },
                     create: { id: 1, currentPriceEur: price },
                 });
             });
-            return res.json({ success: true, minted: qty, priceEur: price, year: y });
+            return res.json({ success: true, minted: qty, priceEur: price, year });
         }
         catch (e) {
             console.error("POST /friday/admin/mint", e);
             return res.status(500).json({ success: false, message: "Server error" });
         }
     });
-    // ✅ ADMIN: Zmena aktuálnej ceny v pokladnici
+    // ✅ ADMIN: Zmena aktuálnej ceny (a voliteľne preceň treasury)
     router.post("/friday/admin/set-price", admin_1.ensureAdmin, async (req, res) => {
         try {
-            const { priceEur } = (req.body || {});
-            const price = Number(priceEur);
+            const { newPrice, repriceTreasury } = req.body;
+            const price = Number(newPrice);
             if (!Number.isFinite(price) || price <= 0) {
-                return res.status(400).json({ success: false, message: "Invalid priceEur" });
+                return res.status(400).json({ success: false, message: "Invalid newPrice" });
             }
-            await prisma.fridaySettings.upsert({
-                where: { id: 1 },
-                update: { currentPriceEur: price },
-                create: { id: 1, currentPriceEur: price },
+            await prisma.$transaction(async (tx) => {
+                // nastav globálnu cenu, ktorú číta supply/purchase
+                await tx.fridaySettings.upsert({
+                    where: { id: 1 },
+                    update: { currentPriceEur: price },
+                    create: { id: 1, currentPriceEur: price },
+                });
+                // (voliteľne) aj preceň existujúce nepredané tokeny v pokladnici
+                if (repriceTreasury) {
+                    await tx.fridayToken.updateMany({
+                        where: { ownerId: null, status: "active" },
+                        data: { originalPriceEur: price },
+                    });
+                }
             });
             return res.json({ success: true, priceEur: price });
         }
