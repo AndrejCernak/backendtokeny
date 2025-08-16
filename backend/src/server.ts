@@ -7,6 +7,7 @@ import cors from "cors";
 import admin from "./firebase-admin";
 import { PrismaClient } from "@prisma/client";
 import { createRemoteJWKSet, jwtVerify } from "jose";
+import { clerkMiddleware } from "@clerk/express";
 
 // ───────────────────────────────────────────────────────────────────────────────
 // Typová rozšírenina pre ws (keepalive)
@@ -158,6 +159,8 @@ app.post("/register-fcm", async (req, res) => {
     return res.status(500).json({ error: "Server error" });
   }
 });
+
+app.use(clerkMiddleware());
 
 // Friday routes (obsahujú admin mint + set-price a zrušený mint-year)
 app.use("/", fridayRoutes(prisma));
