@@ -6,21 +6,23 @@ import http from "http";
 import cors from "cors";
 import admin from "./firebase-admin";
 import { PrismaClient } from "@prisma/client";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 
-// 🔧 rozšírime typ WebSocket o pomocnú vlajku keepalive (isAlive)
+// ───────────────────────────────────────────────────────────────────────────────
+// Typová rozšírenina pre ws (keepalive)
 declare module "ws" {
   interface WebSocket {
     isAlive?: boolean;
   }
 }
 
-
-
-// Friday modules (TS verzie)
+// Friday moduly
 import fridayRoutes from "./friday/routes";
 import { isFridayInBratislava } from "./friday/config";
 import { fridayMinutes, consumeFridaySeconds } from "./friday/db";
 
+// ───────────────────────────────────────────────────────────────────────────────
+// Inicializácie
 const prisma = new PrismaClient();
 const app = express();
 app.use(express.json());
@@ -43,10 +45,38 @@ app.use(
   })
 );
 
+// HTTP + WS server
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// Mapy spojení
+// ───────────────────────────────────────────────────────────────────────────────
+// Clerk JWT overenie cez jose (JWKS)
+const ISSUER = process.env.CLERK_ISSUER; // napr. https://your-subdomain.clerk.accounts.dev
+if (!ISSUER) {
+  console.warn("⚠️  Missing CLERK_ISSUER in env!");
+}
+const JWKS = ISSUER
+  ? createRemoteJWKSet(new URL(`${ISSUER}/.well-known/jwks.json`))
+  : null;
+
+async function getUserIdFromAuthHeader(req: express.Request): Promise<string | null> {
+  try {
+    const auth = req.header("authorization") || req.header("Authorization");
+    if (!auth?.startsWith("Bearer ")) return null;
+    const token = auth.slice("Bearer ".length);
+    if (!JWKS || !ISSUER) return null;
+
+    const { payload } = await jwtVerify(token, JWKS, { issuer: ISSUER });
+    // Clerk user ID býva v `sub`
+    return (payload.sub as string) || null;
+  } catch (e) {
+    console.error("JWT verify error:", e);
+    return null;
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Pomocné štruktúry pre WS
 type Role = "client" | "admin";
 type ClientEntry = { ws: WebSocket | null; fcmToken?: string | null; role?: Role };
 const clients = new Map<string, ClientEntry>();
@@ -55,7 +85,6 @@ type PendingCall = { callerId: string; callerName: string; ts: number };
 const pendingCalls = new Map<string, PendingCall>();
 const PENDING_TTL_MS = 90 * 1000;
 
-// aktívne hovory
 type ActiveCall = {
   callerId: string;
   calleeId: string;
@@ -74,19 +103,40 @@ async function ensureUser(userId: string) {
   await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
 }
 
-// REST: push token persist
+// ───────────────────────────────────────────────────────────────────────────────
+// REST ROUTES
+
+// 1) Po prihlásení z FE zavolaj → upsertne usera (žiadne FK pády potom)
+app.post("/sync-user", async (req, res) => {
+  const userId = await getUserIdFromAuthHeader(req);
+  if (!userId) return res.status(401).json({ error: "Unauthenticated" });
+  try {
+    await ensureUser(userId);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("sync-user error:", e);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+// 2) Registrácia/aktualizácia FCM tokenu pre aktuálneho (overeného) usera
 app.post("/register-fcm", async (req, res) => {
+  const userId = await getUserIdFromAuthHeader(req);
+  if (!userId) return res.status(401).json({ error: "Unauthenticated" });
+
   const body = (req.body || {}) as {
-    userId?: string;
     fcmToken?: string;
     role?: Role;
     platform?: string;
   };
-  const { userId, fcmToken, role, platform } = body;
-  if (!userId || !fcmToken) return res.status(400).json({ error: "Missing userId or fcmToken" });
+  const { fcmToken, role, platform } = body;
+  if (!fcmToken) return res.status(400).json({ error: "Missing fcmToken" });
 
   try {
-    // pamäť (live WS routing)
+    // a) istota, že User existuje (fix FK P2003)
+    await ensureUser(userId);
+
+    // b) cache pre WS
     if (!clients.has(userId)) clients.set(userId, { ws: null, fcmToken, role });
     else {
       const entry = clients.get(userId)!;
@@ -94,7 +144,7 @@ app.post("/register-fcm", async (req, res) => {
       if (role) entry.role = role;
     }
 
-    // DB persist (PushToken model)
+    // c) DB persist (token je unique)
     await prisma.pushToken.upsert({
       where: { token: fcmToken },
       update: { userId, platform: platform || null },
@@ -108,10 +158,11 @@ app.post("/register-fcm", async (req, res) => {
   }
 });
 
-// Friday routes mount
+// Friday routes
 app.use("/", fridayRoutes(prisma));
 
-// WebSocket
+// ───────────────────────────────────────────────────────────────────────────────
+// WEBSOCKET
 wss.on("connection", (ws: WebSocket) => {
   let currentUserId: string | null = null;
 
@@ -123,7 +174,7 @@ wss.on("connection", (ws: WebSocket) => {
     try {
       const data = JSON.parse(message.toString()) as any;
 
-      // registrácia
+      // registrácia klienta do WS mapy
       if (data.type === "register") {
         currentUserId = (data.userId as string) || null;
         if (!currentUserId) return;
@@ -140,7 +191,7 @@ wss.on("connection", (ws: WebSocket) => {
 
         console.log(`✅ ${currentUserId} (${r || "unknown"}) connected via WS`);
 
-        // pending prichádzajúci hovor
+        // ak bol pending prichádzajúci hovor
         const pending = pendingCalls.get(currentUserId);
         if (pending && Date.now() - pending.ts <= PENDING_TTL_MS) {
           try {
@@ -309,7 +360,7 @@ wss.on("connection", (ws: WebSocket) => {
         const target = clients.get(data.targetId as string);
         if (target?.ws && target.ws.readyState === WebSocket.OPEN) {
           try {
-            target.ws.send(JSON.stringify({ type: "end-call", from: currentUserId }));
+            target.ws.send(JSON.stringify({ type: "end-call", from: currentUserId })); // echo na druhú stranu
           } catch (e) {
             console.error("❌ WS end-call forward error:", e);
           }
@@ -386,17 +437,25 @@ const interval = setInterval(() => {
   });
 }, 30000);
 
-// Removed invalid wss "close" event listener; cleanup is handled by process signals below.
-
 // graceful shutdown
 process.on("SIGINT", async () => {
+  clearInterval(interval);
   await prisma.$disconnect();
   process.exit(0);
 });
 process.on("SIGTERM", async () => {
+  clearInterval(interval);
   await prisma.$disconnect();
   process.exit(0);
 });
+
+// ensure admin (ak používaš ADMIN_ID)
+(async () => {
+  const ADMIN_ID = process.env.ADMIN_ID;
+  if (ADMIN_ID) {
+    try { await ensureUser(ADMIN_ID); } catch (e) { console.error("ensure admin error:", e); }
+  }
+})();
 
 const PORT = Number(process.env.PORT || 3001);
 server.listen(PORT, () => console.log(`🚀 Backend running on port ${PORT}`));
