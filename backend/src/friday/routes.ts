@@ -2,19 +2,10 @@
 import express, { Request, Response } from "express";
 import { PrismaClient } from "@prisma/client";
 import { MAX_PRIMARY_TOKENS_PER_USER } from "./config";
-import { ensureAdmin } from "../auth/admin";
 
-/**
- * ROUTES pre piatkové tokeny – admin-riadená pokladnica:
- * - Admin môže mintovať N tokenov s cenou (/friday/admin/mint)
- * - Admin môže meniť aktuálnu cenu v pokladnici (/friday/admin/set-price)
- * - Supply vracia aktuálnu cenu z FridaySettings + počet tokenov v pokladnici
- * - Purchase používa aktuálnu cenu z FridaySettings (nie priceForYear)
- */
 export default function fridayRoutes(prisma: PrismaClient) {
   const router = express.Router();
 
-  // Pomocník: zaistí existenciu FridaySettings (id=1)
   async function ensureSettings() {
     const existing = await prisma.fridaySettings.findUnique({ where: { id: 1 } });
     if (!existing) {
@@ -24,87 +15,87 @@ export default function fridayRoutes(prisma: PrismaClient) {
   }
 
   async function ensureUser(userId: string) {
-    await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
-  }
-
-  // ───────────────────────────────────────────────────────────────────────────
-  // ❌ Pôvodný "mint-year" endpoint sa už NEPOUŽÍVA – odstránený
-
-  // ✅ ADMIN: Mint ľubovoľného počtu tokenov s cenou (a prípadným rokom)
-   // ✅ ADMIN: Mint + nastav currentPriceEur
-router.post("/friday/admin/mint", ensureAdmin, async (req: Request, res: Response) => {
-  try {
-    const { quantity, priceEur } = req.body as { quantity?: number | string; priceEur?: number | string };
-    const qty = Number(quantity);
-    const price = Number(priceEur);
-    const year = new Date().getFullYear();
-
-    if (!Number.isInteger(qty) || qty <= 0 || !Number.isFinite(price) || price <= 0) {
-      return res.status(400).json({ success: false, message: "Invalid quantity/priceEur" });
-    }
-
-    await prisma.$transaction(async (tx) => {
-      // vytvor N tokenov v pokladnici
-      await tx.fridayToken.createMany({
-        data: Array.from({ length: qty }, () => ({
-          minutesRemaining: 60,
-          status: "active",
-          originalPriceEur: price,
-          issuedYear: year,
-        })),
-      });
-
-      // zároveň nastav aktuálnu pokladničnú cenu
-      await tx.fridaySettings.upsert({
-        where: { id: 1 },
-        update: { currentPriceEur: price },
-        create: { id: 1, currentPriceEur: price },
-      });
+    await prisma.user.upsert({
+      where: { id: userId },
+      update: {},
+      create: { id: userId },
     });
-
-    return res.json({ success: true, minted: qty, priceEur: price, year });
-  } catch (e) {
-    console.error("POST /friday/admin/mint", e);
-    return res.status(500).json({ success: false, message: "Server error" });
   }
-});
 
-// ✅ ADMIN: Zmena aktuálnej ceny (a voliteľne preceň treasury)
-router.post("/friday/admin/set-price", ensureAdmin, async (req: Request, res: Response) => {
-  try {
-    const { newPrice, repriceTreasury } = req.body as { newPrice?: number | string; repriceTreasury?: boolean };
-    const price = Number(newPrice);
-    if (!Number.isFinite(price) || price <= 0) {
-      return res.status(400).json({ success: false, message: "Invalid newPrice" });
-    }
+  // Mint tokenov (žiadna verifikácia, hocikto zavolá)
+  router.post("/friday/admin/mint", async (req: Request, res: Response) => {
+    try {
+      const { quantity, priceEur } = req.body as {
+        quantity?: number | string;
+        priceEur?: number | string;
+      };
+      const qty = Number(quantity);
+      const price = Number(priceEur);
+      const year = new Date().getFullYear();
 
-    await prisma.$transaction(async (tx) => {
-      // nastav globálnu cenu, ktorú číta supply/purchase
-      await tx.fridaySettings.upsert({
-        where: { id: 1 },
-        update: { currentPriceEur: price },
-        create: { id: 1, currentPriceEur: price },
-      });
-
-      // (voliteľne) aj preceň existujúce nepredané tokeny v pokladnici
-      if (repriceTreasury) {
-        await tx.fridayToken.updateMany({
-          where: { ownerId: null, status: "active" },
-          data: { originalPriceEur: price },
-        });
+      if (!Number.isInteger(qty) || qty <= 0 || !Number.isFinite(price) || price <= 0) {
+        return res.status(400).json({ success: false, message: "Invalid quantity/priceEur" });
       }
-    });
 
-    return res.json({ success: true, priceEur: price });
-  } catch (e) {
-    console.error("POST /friday/admin/set-price", e);
-    return res.status(500).json({ success: false, message: "Server error" });
-  }
-});
+      await prisma.$transaction(async (tx) => {
+        await tx.fridayToken.createMany({
+          data: Array.from({ length: qty }, () => ({
+            minutesRemaining: 60,
+            status: "active",
+            originalPriceEur: price,
+            issuedYear: year,
+          })),
+        });
 
+        await tx.fridaySettings.upsert({
+          where: { id: 1 },
+          update: { currentPriceEur: price },
+          create: { id: 1, currentPriceEur: price },
+        });
+      });
 
-  // ───────────────────────────────────────────────────────────────────────────
-  // Supply – vráti cenu z FridaySettings a počet tokenov v pokladnici pre daný rok
+      return res.json({ success: true, minted: qty, priceEur: price, year });
+    } catch (e) {
+      console.error("POST /friday/admin/mint", e);
+      return res.status(500).json({ success: false, message: "Server error" });
+    }
+  });
+
+  // Nastavenie ceny
+  router.post("/friday/admin/set-price", async (req: Request, res: Response) => {
+    try {
+      const { newPrice, repriceTreasury } = req.body as {
+        newPrice?: number | string;
+        repriceTreasury?: boolean;
+      };
+      const price = Number(newPrice);
+      if (!Number.isFinite(price) || price <= 0) {
+        return res.status(400).json({ success: false, message: "Invalid newPrice" });
+      }
+
+      await prisma.$transaction(async (tx) => {
+        await tx.fridaySettings.upsert({
+          where: { id: 1 },
+          update: { currentPriceEur: price },
+          create: { id: 1, currentPriceEur: price },
+        });
+
+        if (repriceTreasury) {
+          await tx.fridayToken.updateMany({
+            where: { ownerId: null, status: "active" },
+            data: { originalPriceEur: price },
+          });
+        }
+      });
+
+      return res.json({ success: true, priceEur: price });
+    } catch (e) {
+      console.error("POST /friday/admin/set-price", e);
+      return res.status(500).json({ success: false, message: "Server error" });
+    }
+  });
+
+  // Supply
   router.get("/friday/supply", async (req, res) => {
     try {
       const y = Number((req.query.year as string) || new Date().getFullYear());
@@ -118,7 +109,6 @@ router.post("/friday/admin/set-price", ensureAdmin, async (req: Request, res: Re
         year: y,
         priceEur: Number(settings?.currentPriceEur || 0),
         treasuryAvailable: treasuryCount,
-        // tieto polia už neudržiavame – nechávame nulové kvôli spätnému kompatibilnému tvaru
         totalMinted: 0,
         totalSold: 0,
       });
@@ -128,8 +118,7 @@ router.post("/friday/admin/set-price", ensureAdmin, async (req: Request, res: Re
     }
   });
 
-  // ───────────────────────────────────────────────────────────────────────────
-  // Zostatok užívateľa
+  // Balance
   router.get("/friday/balance/:userId", async (req: Request, res: Response) => {
     try {
       const { userId } = req.params;
@@ -148,7 +137,7 @@ router.post("/friday/admin/set-price", ensureAdmin, async (req: Request, res: Re
     }
   });
 
-  // Nákup z pokladnice – cena z FridaySettings
+  // Purchase
   router.post("/friday/purchase", async (req: Request, res: Response) => {
     try {
       const { userId, quantity, year } = (req.body || {}) as {
@@ -158,7 +147,9 @@ router.post("/friday/admin/set-price", ensureAdmin, async (req: Request, res: Re
       };
 
       if (!userId || !Number.isInteger(quantity) || (quantity as number) <= 0) {
-        return res.status(400).json({ success: false, message: "Missing or invalid userId/quantity" });
+        return res
+          .status(400)
+          .json({ success: false, message: "Missing or invalid userId/quantity" });
       }
       await ensureUser(userId);
 
@@ -170,7 +161,6 @@ router.post("/friday/admin/set-price", ensureAdmin, async (req: Request, res: Re
 
       const y = Number(year) || new Date().getFullYear();
 
-      // limit 20/rok – rátame len držané (active + listed), nie spent
       const ownedThisYear = await prisma.fridayToken.count({
         where: { ownerId: userId, issuedYear: y, status: { in: ["active", "listed"] } },
       });
@@ -187,7 +177,9 @@ router.post("/friday/admin/set-price", ensureAdmin, async (req: Request, res: Re
         select: { id: true },
       });
       if (available.length < (quantity as number)) {
-        return res.status(400).json({ success: false, message: "Not enough tokens in treasury" });
+        return res
+          .status(400)
+          .json({ success: false, message: "Not enough tokens in treasury" });
       }
 
       const amountEur = unitPrice * (quantity as number);
@@ -224,7 +216,7 @@ router.post("/friday/admin/set-price", ensureAdmin, async (req: Request, res: Re
     }
   });
 
-  // Listovanie tokenu na burzu
+  // Listings
   router.post("/friday/list", async (req: Request, res: Response) => {
     try {
       const { sellerId, tokenId, priceEur } = (req.body || {}) as {
@@ -235,7 +227,9 @@ router.post("/friday/admin/set-price", ensureAdmin, async (req: Request, res: Re
       const price = Number(priceEur);
 
       if (!sellerId || !tokenId || !Number.isFinite(price) || price <= 0) {
-        return res.status(400).json({ success: false, message: "Missing or invalid fields" });
+        return res
+          .status(400)
+          .json({ success: false, message: "Missing or invalid fields" });
       }
 
       const token = await prisma.fridayToken.findUnique({ where: { id: tokenId } });
@@ -258,10 +252,12 @@ router.post("/friday/admin/set-price", ensureAdmin, async (req: Request, res: Re
     }
   });
 
-  // Zrušenie listingu
   router.post("/friday/cancel-listing", async (req: Request, res: Response) => {
     try {
-      const { sellerId, listingId } = (req.body || {}) as { sellerId?: string; listingId?: string };
+      const { sellerId, listingId } = (req.body || {}) as {
+        sellerId?: string;
+        listingId?: string;
+      };
       const listing = await prisma.fridayListing.findUnique({
         where: { id: listingId },
         include: { token: true },
@@ -275,7 +271,10 @@ router.post("/friday/admin/set-price", ensureAdmin, async (req: Request, res: Re
           where: { id: listingId },
           data: { status: "cancelled", closedAt: new Date() },
         });
-        await tx.fridayToken.update({ where: { id: listing.tokenId }, data: { status: "active" } });
+        await tx.fridayToken.update({
+          where: { id: listing.tokenId },
+          data: { status: "active" },
+        });
       });
 
       return res.json({ success: true });
@@ -285,16 +284,12 @@ router.post("/friday/admin/set-price", ensureAdmin, async (req: Request, res: Re
     }
   });
 
-  // Zoznam otvorených ponúk
   router.get("/friday/listings", async (_req: Request, res: Response) => {
     try {
-      const take = 50;
-      const skip = 0;
       const items = await prisma.fridayListing.findMany({
         where: { status: "open" },
         orderBy: { createdAt: "desc" },
-        take,
-        skip,
+        take: 50,
         include: { token: true },
       });
       return res.json({ items });
