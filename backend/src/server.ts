@@ -1,4 +1,4 @@
-// server.ts
+// backend/server.ts
 import "dotenv/config";
 import express from "express";
 import WebSocket, { WebSocketServer, RawData } from "ws";
@@ -7,6 +7,7 @@ import cors from "cors";
 import admin from "./firebase-admin";
 import { PrismaClient } from "@prisma/client";
 import { createRemoteJWKSet, jwtVerify } from "jose";
+import { randomUUID } from "crypto";
 
 // ───────────────────────────────────────────────────────────────────────────────
 // Typová rozšírenina pre ws (keepalive)
@@ -81,9 +82,11 @@ type Role = "client" | "admin";
 type ClientEntry = { ws: WebSocket | null; fcmToken?: string | null; role?: Role };
 const clients = new Map<string, ClientEntry>();
 
-type PendingCall = { callerId: string; callerName: string; ts: number };
+type PendingCall = { callId: string; callerId: string; callerName: string; ts: number };
+// predĺžené TTL na hladký “open from push” scenár
+const PENDING_TTL_MS = 3 * 60 * 1000; // 3 min
 const pendingCalls = new Map<string, PendingCall>();
-const PENDING_TTL_MS = 90 * 1000;
+
 
 type ActiveCall = {
   callerId: string;
@@ -158,8 +161,32 @@ app.post("/register-fcm", async (req, res) => {
   }
 });
 
-// Friday routes
+// 3) Friday routes
 app.use("/", fridayRoutes(prisma));
+
+// 4) REST fallback: zisti pending prichádzajúci hovor pre aktuálneho užívateľa (admina)
+app.get("/calls/pending", async (req, res) => {
+  try {
+    const userId = await getUserIdFromAuthHeader(req);
+    if (!userId) return res.status(401).json({ error: "Unauthenticated" });
+
+    const p = pendingCalls.get(userId);
+    if (p && Date.now() - p.ts <= PENDING_TTL_MS) {
+      return res.json({
+        pending: {
+          callId: p.callId,
+          callerId: p.callerId,
+          callerName: p.callerName,
+          expiresInMs: Math.max(0, PENDING_TTL_MS - (Date.now() - p.ts)),
+        },
+      });
+    }
+    return res.json({ pending: null });
+  } catch (e) {
+    console.error("calls/pending error:", e);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
 
 // ───────────────────────────────────────────────────────────────────────────────
 // WEBSOCKET
@@ -191,18 +218,18 @@ wss.on("connection", (ws: WebSocket) => {
 
         console.log(`✅ ${currentUserId} (${r || "unknown"}) connected via WS`);
 
-        // ak bol pending prichádzajúci hovor
+        // ak bol pending prichádzajúci hovor → znovu doruč "incoming-call" (nevymazávame hneď)
         const pending = pendingCalls.get(currentUserId);
         if (pending && Date.now() - pending.ts <= PENDING_TTL_MS) {
           try {
             ws.send(
               JSON.stringify({
                 type: "incoming-call",
+                callId: pending.callId,
                 callerId: pending.callerId,
                 callerName: pending.callerName,
               })
             );
-            pendingCalls.delete(currentUserId);
           } catch (e) {
             console.error("❌ Failed to deliver pending incoming-call:", e);
           }
@@ -229,13 +256,21 @@ wss.on("connection", (ws: WebSocket) => {
         console.log(`📞 Call request from ${currentUserId} to ${targetId}`);
         const target = clients.get(targetId);
 
-        // uložiť pending call
-        pendingCalls.set(targetId, { callerId: currentUserId, callerName, ts: Date.now() });
+        // vygeneruj callId a ulož pending call
+        const callId = randomUUID();
+        pendingCalls.set(targetId, { callId, callerId: currentUserId, callerName, ts: Date.now() });
 
         // WS notifikácia adminovi
         if (target?.ws && target.ws.readyState === WebSocket.OPEN) {
           try {
-            target.ws.send(JSON.stringify({ type: "incoming-call", callerId: currentUserId, callerName }));
+            target.ws.send(
+              JSON.stringify({
+                type: "incoming-call",
+                callId,
+                callerId: currentUserId,
+                callerName,
+              })
+            );
           } catch (e) {
             console.error("❌ WS send incoming-call error:", e);
           }
@@ -255,7 +290,12 @@ wss.on("connection", (ws: WebSocket) => {
             await admin.messaging().send({
               token: targetToken,
               notification: { title: "Prichádzajúci hovor", body: `${callerName} ti volá` },
-              data: { type: "incoming_call", callerId: currentUserId, callerName },
+              data: {
+                type: "incoming_call",
+                callId,
+                callerId: currentUserId,
+                callerName,
+              },
             });
             console.log(`📩 Push notification sent to ${targetId}`);
           }
@@ -271,7 +311,7 @@ wss.on("connection", (ws: WebSocket) => {
         const target = clients.get(data.targetId as string);
         if (target?.ws && target.ws.readyState === WebSocket.OPEN) {
           try {
-            const payload = { ...data, from: currentUserId };
+            const payload = { ...data, from: currentUserId }; // callId nechávame v data nedotknutý
             target.ws.send(JSON.stringify(payload));
           } catch (e) {
             console.error(`❌ WS forward ${data.type} error:`, e);
@@ -282,6 +322,12 @@ wss.on("connection", (ws: WebSocket) => {
         if (data.type === "webrtc-answer") {
           const callerId = data.targetId as string;
           const calleeId = currentUserId;
+
+          // po úspešnom answeri vyčisti pending pre prijímateľa (admina), ak sedí callId (ak nie je, čistíme tiež)
+          const pend = pendingCalls.get(calleeId);
+          if (pend && (!data.callId || data.callId === pend.callId)) {
+            pendingCalls.delete(calleeId);
+          }
 
           const key = callKeyFor(callerId, calleeId);
           if (!activeCalls.has(key)) {
@@ -453,7 +499,11 @@ process.on("SIGTERM", async () => {
 (async () => {
   const ADMIN_ID = process.env.ADMIN_ID;
   if (ADMIN_ID) {
-    try { await ensureUser(ADMIN_ID); } catch (e) { console.error("ensure admin error:", e); }
+    try {
+      await ensureUser(ADMIN_ID);
+    } catch (e) {
+      console.error("ensure admin error:", e);
+    }
   }
 })();
 

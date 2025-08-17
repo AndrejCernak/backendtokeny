@@ -36,7 +36,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-// server.ts
+// backend/server.ts
 require("dotenv/config");
 const express_1 = __importDefault(require("express"));
 const ws_1 = __importStar(require("ws"));
@@ -45,6 +45,7 @@ const cors_1 = __importDefault(require("cors"));
 const firebase_admin_1 = __importDefault(require("./firebase-admin"));
 const client_1 = require("@prisma/client");
 const jose_1 = require("jose");
+const crypto_1 = require("crypto");
 // Friday moduly
 const routes_1 = __importDefault(require("./friday/routes"));
 const config_1 = require("./friday/config");
@@ -100,8 +101,9 @@ async function getUserIdFromAuthHeader(req) {
     }
 }
 const clients = new Map();
+// predĺžené TTL na hladký “open from push” scenár
+const PENDING_TTL_MS = 3 * 60 * 1000; // 3 min
 const pendingCalls = new Map();
-const PENDING_TTL_MS = 90 * 1000;
 const activeCalls = new Map();
 const PRICE_PER_SECOND = 0.125;
 function callKeyFor(a, b) {
@@ -160,8 +162,32 @@ app.post("/register-fcm", async (req, res) => {
         return res.status(500).json({ error: "Server error" });
     }
 });
-// Friday routes
+// 3) Friday routes
 app.use("/", (0, routes_1.default)(prisma));
+// 4) REST fallback: zisti pending prichádzajúci hovor pre aktuálneho užívateľa (admina)
+app.get("/calls/pending", async (req, res) => {
+    try {
+        const userId = await getUserIdFromAuthHeader(req);
+        if (!userId)
+            return res.status(401).json({ error: "Unauthenticated" });
+        const p = pendingCalls.get(userId);
+        if (p && Date.now() - p.ts <= PENDING_TTL_MS) {
+            return res.json({
+                pending: {
+                    callId: p.callId,
+                    callerId: p.callerId,
+                    callerName: p.callerName,
+                    expiresInMs: Math.max(0, PENDING_TTL_MS - (Date.now() - p.ts)),
+                },
+            });
+        }
+        return res.json({ pending: null });
+    }
+    catch (e) {
+        console.error("calls/pending error:", e);
+        return res.status(500).json({ error: "Server error" });
+    }
+});
 // ───────────────────────────────────────────────────────────────────────────────
 // WEBSOCKET
 wss.on("connection", (ws) => {
@@ -188,16 +214,16 @@ wss.on("connection", (ws) => {
                         entry.role = r;
                 }
                 console.log(`✅ ${currentUserId} (${r || "unknown"}) connected via WS`);
-                // ak bol pending prichádzajúci hovor
+                // ak bol pending prichádzajúci hovor → znovu doruč "incoming-call" (nevymazávame hneď)
                 const pending = pendingCalls.get(currentUserId);
                 if (pending && Date.now() - pending.ts <= PENDING_TTL_MS) {
                     try {
                         ws.send(JSON.stringify({
                             type: "incoming-call",
+                            callId: pending.callId,
                             callerId: pending.callerId,
                             callerName: pending.callerName,
                         }));
-                        pendingCalls.delete(currentUserId);
                     }
                     catch (e) {
                         console.error("❌ Failed to deliver pending incoming-call:", e);
@@ -222,12 +248,18 @@ wss.on("connection", (ws) => {
                 }
                 console.log(`📞 Call request from ${currentUserId} to ${targetId}`);
                 const target = clients.get(targetId);
-                // uložiť pending call
-                pendingCalls.set(targetId, { callerId: currentUserId, callerName, ts: Date.now() });
+                // vygeneruj callId a ulož pending call
+                const callId = (0, crypto_1.randomUUID)();
+                pendingCalls.set(targetId, { callId, callerId: currentUserId, callerName, ts: Date.now() });
                 // WS notifikácia adminovi
                 if (target?.ws && target.ws.readyState === ws_1.default.OPEN) {
                     try {
-                        target.ws.send(JSON.stringify({ type: "incoming-call", callerId: currentUserId, callerName }));
+                        target.ws.send(JSON.stringify({
+                            type: "incoming-call",
+                            callId,
+                            callerId: currentUserId,
+                            callerName,
+                        }));
                     }
                     catch (e) {
                         console.error("❌ WS send incoming-call error:", e);
@@ -247,7 +279,12 @@ wss.on("connection", (ws) => {
                         await firebase_admin_1.default.messaging().send({
                             token: targetToken,
                             notification: { title: "Prichádzajúci hovor", body: `${callerName} ti volá` },
-                            data: { type: "incoming_call", callerId: currentUserId, callerName },
+                            data: {
+                                type: "incoming_call",
+                                callId,
+                                callerId: currentUserId,
+                                callerName,
+                            },
                         });
                         console.log(`📩 Push notification sent to ${targetId}`);
                     }
@@ -263,7 +300,7 @@ wss.on("connection", (ws) => {
                 const target = clients.get(data.targetId);
                 if (target?.ws && target.ws.readyState === ws_1.default.OPEN) {
                     try {
-                        const payload = { ...data, from: currentUserId };
+                        const payload = { ...data, from: currentUserId }; // callId nechávame v data nedotknutý
                         target.ws.send(JSON.stringify(payload));
                     }
                     catch (e) {
@@ -274,6 +311,11 @@ wss.on("connection", (ws) => {
                 if (data.type === "webrtc-answer") {
                     const callerId = data.targetId;
                     const calleeId = currentUserId;
+                    // po úspešnom answeri vyčisti pending pre prijímateľa (admina), ak sedí callId (ak nie je, čistíme tiež)
+                    const pend = pendingCalls.get(calleeId);
+                    if (pend && (!data.callId || data.callId === pend.callId)) {
+                        pendingCalls.delete(calleeId);
+                    }
                     const key = callKeyFor(callerId, calleeId);
                     if (!activeCalls.has(key)) {
                         try {
