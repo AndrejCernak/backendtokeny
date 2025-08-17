@@ -100,6 +100,7 @@ async function getUserIdFromAuthHeader(req) {
         return null;
     }
 }
+// namiesto jedného socketu na usera -> Set socketov (všetky okná/zariadenia)
 const clients = new Map();
 // predĺžené TTL na hladký “open from push” scenár
 const PENDING_TTL_MS = 3 * 60 * 1000; // 3 min
@@ -111,6 +112,62 @@ function callKeyFor(a, b) {
 }
 async function ensureUser(userId) {
     await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+}
+// WS broadcast helpery
+function sendToUser(userId, msg) {
+    const set = clients.get(userId);
+    if (!set)
+        return;
+    const json = JSON.stringify(msg);
+    for (const sock of set) {
+        if (sock.readyState === ws_1.default.OPEN) {
+            try {
+                sock.send(json);
+            }
+            catch { }
+        }
+    }
+}
+function sendToUserExcept(userId, except, msg) {
+    const set = clients.get(userId);
+    if (!set)
+        return;
+    const json = JSON.stringify(msg);
+    for (const sock of set) {
+        if (sock === except)
+            continue;
+        if (sock.readyState === ws_1.default.OPEN) {
+            try {
+                sock.send(json);
+            }
+            catch { }
+        }
+    }
+}
+// FCM: pošli push na všetky zariadenia usera + cleanup zlých tokenov
+async function sendPushToAllUserDevices(userId, payload) {
+    const rows = await prisma.pushToken.findMany({ where: { userId } });
+    const tokens = rows.map((r) => r.token).filter(Boolean);
+    if (!tokens.length)
+        return;
+    const resp = await firebase_admin_1.default.messaging().sendEachForMulticast({
+        tokens,
+        notification: payload.notification,
+        data: payload.data,
+    });
+    const toDelete = [];
+    resp.responses.forEach((r, i) => {
+        if (!r.success) {
+            const code = r.error?.code;
+            if (code === "messaging/registration-token-not-registered" ||
+                code === "messaging/invalid-registration-token") {
+                toDelete.push(tokens[i]);
+            }
+        }
+    });
+    if (toDelete.length) {
+        await prisma.pushToken.deleteMany({ where: { token: { in: toDelete } } });
+    }
 }
 // ───────────────────────────────────────────────────────────────────────────────
 // REST ROUTES
@@ -134,22 +191,13 @@ app.post("/register-fcm", async (req, res) => {
     if (!userId)
         return res.status(401).json({ error: "Unauthenticated" });
     const body = (req.body || {});
-    const { fcmToken, role, platform } = body;
+    const { fcmToken, platform } = body;
     if (!fcmToken)
         return res.status(400).json({ error: "Missing fcmToken" });
     try {
         // a) istota, že User existuje (fix FK P2003)
         await ensureUser(userId);
-        // b) cache pre WS
-        if (!clients.has(userId))
-            clients.set(userId, { ws: null, fcmToken, role });
-        else {
-            const entry = clients.get(userId);
-            entry.fcmToken = fcmToken;
-            if (role)
-                entry.role = role;
-        }
-        // c) DB persist (token je unique)
+        // b) DB persist (token je unique)
         await prisma.pushToken.upsert({
             where: { token: fcmToken },
             update: { userId, platform: platform || null },
@@ -203,18 +251,15 @@ wss.on("connection", (ws) => {
                 currentUserId = data.userId || null;
                 if (!currentUserId)
                     return;
-                const r = data.role || clients.get(currentUserId)?.role;
-                if (!clients.has(currentUserId)) {
-                    clients.set(currentUserId, { ws, role: r });
+                // pridaj socket do setu pre usera
+                let set = clients.get(currentUserId);
+                if (!set) {
+                    set = new Set();
+                    clients.set(currentUserId, set);
                 }
-                else {
-                    const entry = clients.get(currentUserId);
-                    entry.ws = ws;
-                    if (r)
-                        entry.role = r;
-                }
-                console.log(`✅ ${currentUserId} (${r || "unknown"}) connected via WS`);
-                // ak bol pending prichádzajúci hovor → znovu doruč "incoming-call" (nevymazávame hneď)
+                set.add(ws);
+                console.log(`✅ ${currentUserId} connected via WS (now ${set.size} socket(s))`);
+                // ak bol pending prichádzajúci hovor → doruč "incoming-call" do tohto socketu (nevymazávame hneď)
                 const pending = pendingCalls.get(currentUserId);
                 if (pending && Date.now() - pending.ts <= PENDING_TTL_MS) {
                     try {
@@ -239,55 +284,33 @@ wss.on("connection", (ws) => {
                 if ((0, config_1.isFridayInBratislava)()) {
                     const minutes = await (0, db_1.fridayMinutes)(currentUserId);
                     if (minutes <= 0) {
-                        const caller = clients.get(currentUserId);
-                        if (caller?.ws && caller.ws.readyState === ws_1.default.OPEN) {
-                            caller.ws.send(JSON.stringify({ type: "insufficient-friday-tokens" }));
-                        }
+                        sendToUser(currentUserId, { type: "insufficient-friday-tokens" });
                         return;
                     }
                 }
                 console.log(`📞 Call request from ${currentUserId} to ${targetId}`);
-                const target = clients.get(targetId);
                 // vygeneruj callId a ulož pending call
                 const callId = (0, crypto_1.randomUUID)();
                 pendingCalls.set(targetId, { callId, callerId: currentUserId, callerName, ts: Date.now() });
-                // WS notifikácia adminovi
-                if (target?.ws && target.ws.readyState === ws_1.default.OPEN) {
-                    try {
-                        target.ws.send(JSON.stringify({
-                            type: "incoming-call",
+                // WS notifikácia adminovi (na všetky otvorené okná/zariadenia)
+                sendToUser(targetId, {
+                    type: "incoming-call",
+                    callId,
+                    callerId: currentUserId,
+                    callerName,
+                });
+                // FCM notifikácia (na všetky zariadenia admina)
+                try {
+                    await sendPushToAllUserDevices(targetId, {
+                        notification: { title: "Prichádzajúci hovor", body: `${callerName} ti volá` },
+                        data: {
+                            type: "incoming_call",
                             callId,
                             callerId: currentUserId,
                             callerName,
-                        }));
-                    }
-                    catch (e) {
-                        console.error("❌ WS send incoming-call error:", e);
-                    }
-                }
-                // FCM notifikácia (fallback z DB)
-                try {
-                    let targetToken = target?.fcmToken ?? null;
-                    if (!targetToken) {
-                        const dbTok = await prisma.pushToken.findFirst({
-                            where: { userId: targetId },
-                            orderBy: { updatedAt: "desc" },
-                        });
-                        targetToken = dbTok?.token || null;
-                    }
-                    if (targetToken) {
-                        await firebase_admin_1.default.messaging().send({
-                            token: targetToken,
-                            notification: { title: "Prichádzajúci hovor", body: `${callerName} ti volá` },
-                            data: {
-                                type: "incoming_call",
-                                callId,
-                                callerId: currentUserId,
-                                callerName,
-                            },
-                        });
-                        console.log(`📩 Push notification sent to ${targetId}`);
-                    }
+                        },
+                    });
+                    console.log(`📩 Push notification sent to ALL devices of ${targetId}`);
                 }
                 catch (e) {
                     console.error("❌ FCM send error:", e);
@@ -297,25 +320,23 @@ wss.on("connection", (ws) => {
             if (["webrtc-offer", "webrtc-answer", "webrtc-candidate", "request-offer"].includes(data.type)) {
                 if (!currentUserId || !data.targetId)
                     return;
-                const target = clients.get(data.targetId);
-                if (target?.ws && target.ws.readyState === ws_1.default.OPEN) {
-                    try {
-                        const payload = { ...data, from: currentUserId }; // callId nechávame v data nedotknutý
-                        target.ws.send(JSON.stringify(payload));
-                    }
-                    catch (e) {
-                        console.error(`❌ WS forward ${data.type} error:`, e);
-                    }
-                }
-                // ANSWER → začni billing len v piatok
+                // forward na všetky WS cieľa
+                sendToUser(data.targetId, { ...data, from: currentUserId });
+                // ANSWER → začni billing len v piatok + lock pre ostatné zariadenia admina
                 if (data.type === "webrtc-answer") {
-                    const callerId = data.targetId;
-                    const calleeId = currentUserId;
-                    // po úspešnom answeri vyčisti pending pre prijímateľa (admina), ak sedí callId (ak nie je, čistíme tiež)
+                    const callerId = data.targetId; // komu posielame answer (volajúci)
+                    const calleeId = currentUserId; // kto odpovedá (admin)
+                    // po answeri zruš pending pre callee (admina), aby ostatné jeho okná zhasli banner
                     const pend = pendingCalls.get(calleeId);
                     if (pend && (!data.callId || data.callId === pend.callId)) {
                         pendingCalls.delete(calleeId);
                     }
+                    // pošli "call-locked" do ostatných WS toho istého admina
+                    sendToUserExcept(calleeId, ws, {
+                        type: "call-locked",
+                        callId: data.callId,
+                        by: calleeId,
+                    });
                     const key = callKeyFor(callerId, calleeId);
                     if (!activeCalls.has(key)) {
                         try {
@@ -329,21 +350,14 @@ wss.on("connection", (ws) => {
                                     if ((0, config_1.isFridayInBratislava)()) {
                                         const deficit = await (0, db_1.consumeFridaySeconds)(callerId, 10);
                                         const minutesLeft = await (0, db_1.fridayMinutes)(callerId);
-                                        const caller = clients.get(callerId);
-                                        if (caller?.ws && caller.ws.readyState === ws_1.default.OPEN) {
-                                            caller.ws.send(JSON.stringify({ type: "friday-balance-update", minutesRemaining: minutesLeft }));
-                                        }
+                                        sendToUser(callerId, {
+                                            type: "friday-balance-update",
+                                            minutesRemaining: minutesLeft,
+                                        });
                                         if (deficit > 0 || minutesLeft <= 0) {
-                                            const msg = JSON.stringify({ type: "end-call", reason: "no-friday-tokens" });
-                                            const callee = clients.get(calleeId);
-                                            try {
-                                                caller?.ws && caller.ws.readyState === ws_1.default.OPEN && caller.ws.send(msg);
-                                            }
-                                            catch { }
-                                            try {
-                                                callee?.ws && callee.ws.readyState === ws_1.default.OPEN && callee.ws.send(msg);
-                                            }
-                                            catch { }
+                                            const msg = { type: "end-call", reason: "no-friday-tokens" };
+                                            sendToUser(callerId, msg);
+                                            sendToUser(calleeId, msg);
                                             const endedAt = new Date();
                                             const secondsBilled = Math.ceil((endedAt.getTime() - session.startedAt.getTime()) / 1000);
                                             const priceEur = (secondsBilled * PRICE_PER_SECOND).toFixed(2);
@@ -368,10 +382,8 @@ wss.on("connection", (ws) => {
                                 startedAt: session.startedAt,
                                 callSessionId: session.id,
                             });
-                            const callerEntry = clients.get(callerId);
-                            if (callerEntry?.ws && callerEntry.ws.readyState === ws_1.default.OPEN) {
-                                callerEntry.ws.send(JSON.stringify({ type: "call-started", from: calleeId }));
-                            }
+                            // volajúcemu pošli info, že hovor sa začal
+                            sendToUser(callerId, { type: "call-started", from: calleeId });
                         }
                         catch (e) {
                             console.error("callSession start error:", e);
@@ -381,17 +393,13 @@ wss.on("connection", (ws) => {
             }
             // manuálne ukončenie hovoru
             if (data.type === "end-call") {
-                const target = clients.get(data.targetId);
-                if (target?.ws && target.ws.readyState === ws_1.default.OPEN) {
-                    try {
-                        target.ws.send(JSON.stringify({ type: "end-call", from: currentUserId })); // echo na druhú stranu
-                    }
-                    catch (e) {
-                        console.error("❌ WS end-call forward error:", e);
-                    }
-                }
+                const targetId = data.targetId;
+                // echo na druhú stranu + aj späť volajúcemu (všetky jeho WS)
+                sendToUser(targetId, { type: "end-call", from: currentUserId });
+                if (currentUserId)
+                    sendToUser(currentUserId, { type: "end-call", from: targetId });
                 if (currentUserId) {
-                    const key = callKeyFor(currentUserId, data.targetId);
+                    const key = callKeyFor(currentUserId, targetId);
                     const c = activeCalls.get(key);
                     if (c) {
                         clearInterval(c.intervalId);
@@ -417,6 +425,17 @@ wss.on("connection", (ws) => {
         }
     });
     ws.on("close", () => {
+        // odpoj tento socket zo setu usera
+        if (currentUserId) {
+            const set = clients.get(currentUserId);
+            if (set) {
+                set.delete(ws);
+                if (set.size === 0)
+                    clients.delete(currentUserId);
+            }
+            console.log(`🔌 ${currentUserId} disconnected (remaining ${clients.get(currentUserId)?.size || 0})`);
+        }
+        // cleanup aktívnych hovorov (ak sa tento user podieľal)
         if (currentUserId) {
             for (const [key, c] of activeCalls.entries()) {
                 if (c.callerId === currentUserId || c.calleeId === currentUserId) {
@@ -438,12 +457,6 @@ wss.on("connection", (ws) => {
                     })();
                 }
             }
-        }
-        if (currentUserId && clients.has(currentUserId)) {
-            const entry = clients.get(currentUserId);
-            if (entry)
-                entry.ws = null;
-            console.log(`🔌 ${currentUserId} disconnected`);
         }
     });
     ws.on("error", (e) => {
