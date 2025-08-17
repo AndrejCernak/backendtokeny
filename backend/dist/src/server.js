@@ -55,31 +55,38 @@ const db_1 = require("./friday/db");
 const prisma = new client_1.PrismaClient();
 const app = (0, express_1.default)();
 app.use(express_1.default.json());
-// CORS
-const allowedOrigins = [
+// CORS (vrátane vercel preview domén)
+const allowedOrigins = new Set([
     "https://frontendtokeny.vercel.app",
-    "https://frontendtokeny-42hveafvm-andrejcernaks-projects.vercel.app",
     "http://localhost:3000",
-];
+    "http://127.0.0.1:3000",
+]);
 app.use((0, cors_1.default)({
     origin(origin, callback) {
-        if (!origin || allowedOrigins.includes(origin))
-            callback(null, true);
-        else
-            callback(new Error("Not allowed by CORS"));
+        if (!origin)
+            return callback(null, true);
+        try {
+            const url = new URL(origin);
+            const ok = allowedOrigins.has(origin) ||
+                /\.vercel\.app$/.test(url.hostname); // povolí všetky vercel preview
+            if (ok)
+                return callback(null, true);
+        }
+        catch { }
+        return callback(new Error("Not allowed by CORS"));
     },
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true,
 }));
 // HTTP + WS server
 const server = http_1.default.createServer(app);
 const wss = new ws_1.WebSocketServer({ server });
 // ───────────────────────────────────────────────────────────────────────────────
-// Clerk JWT overenie cez jose (JWKS)
+// Clerk JWT (pre REST). WS registrácia nechávame kompatibilnú s FE (posiela userId).
 const ISSUER = process.env.CLERK_ISSUER; // napr. https://your-subdomain.clerk.accounts.dev
-if (!ISSUER) {
+if (!ISSUER)
     console.warn("⚠️  Missing CLERK_ISSUER in env!");
-}
 const JWKS = ISSUER
     ? (0, jose_1.createRemoteJWKSet)(new URL(`${ISSUER}/.well-known/jwks.json`))
     : null;
@@ -92,7 +99,6 @@ async function getUserIdFromAuthHeader(req) {
         if (!JWKS || !ISSUER)
             return null;
         const { payload } = await (0, jose_1.jwtVerify)(token, JWKS, { issuer: ISSUER });
-        // Clerk user ID býva v `sub`
         return payload.sub || null;
     }
     catch (e) {
@@ -102,9 +108,8 @@ async function getUserIdFromAuthHeader(req) {
 }
 // namiesto jedného socketu na usera -> Set socketov (všetky okná/zariadenia)
 const clients = new Map();
-// predĺžené TTL na hladký “open from push” scenár
 const PENDING_TTL_MS = 3 * 60 * 1000; // 3 min
-const pendingCalls = new Map();
+const pendingCalls = new Map(); // kľúč: calleeId (admin)
 const activeCalls = new Map();
 const PRICE_PER_SECOND = 0.125;
 function callKeyFor(a, b) {
@@ -171,7 +176,7 @@ async function sendPushToAllUserDevices(userId, payload) {
 }
 // ───────────────────────────────────────────────────────────────────────────────
 // REST ROUTES
-// 1) Po prihlásení z FE zavolaj → upsertne usera (žiadne FK pády potom)
+// 1) Po prihlásení z FE → upsert usera (kvôli FK)
 app.post("/sync-user", async (req, res) => {
     const userId = await getUserIdFromAuthHeader(req);
     if (!userId)
@@ -185,7 +190,7 @@ app.post("/sync-user", async (req, res) => {
         return res.status(500).json({ error: "Server error" });
     }
 });
-// 2) Registrácia/aktualizácia FCM tokenu pre aktuálneho (overeného) usera
+// 2) Registrácia/aktualizácia FCM tokenu
 app.post("/register-fcm", async (req, res) => {
     const userId = await getUserIdFromAuthHeader(req);
     if (!userId)
@@ -195,9 +200,7 @@ app.post("/register-fcm", async (req, res) => {
     if (!fcmToken)
         return res.status(400).json({ error: "Missing fcmToken" });
     try {
-        // a) istota, že User existuje (fix FK P2003)
         await ensureUser(userId);
-        // b) DB persist (token je unique)
         await prisma.pushToken.upsert({
             where: { token: fcmToken },
             update: { userId, platform: platform || null },
@@ -246,12 +249,11 @@ wss.on("connection", (ws) => {
     ws.on("message", async (message) => {
         try {
             const data = JSON.parse(message.toString());
-            // registrácia klienta do WS mapy
+            // registrácia klienta do WS mapy (FE posiela {type:"register", userId})
             if (data.type === "register") {
                 currentUserId = data.userId || null;
                 if (!currentUserId)
                     return;
-                // pridaj socket do setu pre usera
                 let set = clients.get(currentUserId);
                 if (!set) {
                     set = new Set();
@@ -326,15 +328,16 @@ wss.on("connection", (ws) => {
                 if (data.type === "webrtc-answer") {
                     const callerId = data.targetId; // komu posielame answer (volajúci)
                     const calleeId = currentUserId; // kto odpovedá (admin)
+                    const thisCallId = data.callId;
                     // po answeri zruš pending pre callee (admina), aby ostatné jeho okná zhasli banner
                     const pend = pendingCalls.get(calleeId);
-                    if (pend && (!data.callId || data.callId === pend.callId)) {
+                    if (pend && (!thisCallId || thisCallId === pend.callId)) {
                         pendingCalls.delete(calleeId);
                     }
-                    // pošli "call-locked" do ostatných WS toho istého admina
+                    // pošli "call-locked" do ostatných WS toho istého admina (s callId kvôli presnosti)
                     sendToUserExcept(calleeId, ws, {
                         type: "call-locked",
-                        callId: data.callId,
+                        callId: thisCallId,
                         by: calleeId,
                     });
                     const key = callKeyFor(callerId, calleeId);
@@ -369,7 +372,6 @@ wss.on("connection", (ws) => {
                                             activeCalls.delete(key);
                                         }
                                     }
-                                    // mimo piatku: nič neúčtujeme
                                 }
                                 catch (e) {
                                     console.error("decrement/billing interval error:", e);
@@ -382,8 +384,9 @@ wss.on("connection", (ws) => {
                                 startedAt: session.startedAt,
                                 callSessionId: session.id,
                             });
-                            // volajúcemu pošli info, že hovor sa začal
-                            sendToUser(callerId, { type: "call-started", from: calleeId });
+                            // ⚠️ Dôležité: pošli call-started OBOm stranám (FE sa na to spolieha)
+                            sendToUser(callerId, { type: "call-started", from: calleeId, callId: thisCallId });
+                            sendToUser(calleeId, { type: "call-started", from: callerId, callId: thisCallId });
                         }
                         catch (e) {
                             console.error("callSession start error:", e);
@@ -395,9 +398,9 @@ wss.on("connection", (ws) => {
             if (data.type === "end-call") {
                 const targetId = data.targetId;
                 // echo na druhú stranu + aj späť volajúcemu (všetky jeho WS)
-                sendToUser(targetId, { type: "end-call", from: currentUserId });
+                sendToUser(targetId, { type: "end-call", from: currentUserId, callId: data.callId });
                 if (currentUserId)
-                    sendToUser(currentUserId, { type: "end-call", from: targetId });
+                    sendToUser(currentUserId, { type: "end-call", from: targetId, callId: data.callId });
                 if (currentUserId) {
                     const key = callKeyFor(currentUserId, targetId);
                     const c = activeCalls.get(key);
@@ -435,8 +438,8 @@ wss.on("connection", (ws) => {
             }
             console.log(`🔌 ${currentUserId} disconnected (remaining ${clients.get(currentUserId)?.size || 0})`);
         }
-        // cleanup aktívnych hovorov (ak sa tento user podieľal)
-        if (currentUserId) {
+        // cleanup aktívnych hovorov IBA ak užívateľ už nemá ŽIADNE ďalšie WS
+        if (currentUserId && !clients.get(currentUserId)) {
             for (const [key, c] of activeCalls.entries()) {
                 if (c.callerId === currentUserId || c.calleeId === currentUserId) {
                     clearInterval(c.intervalId);
@@ -478,11 +481,15 @@ const interval = setInterval(() => {
 // graceful shutdown
 process.on("SIGINT", async () => {
     clearInterval(interval);
+    wss.clients.forEach((c) => c.terminate());
+    server.close();
     await prisma.$disconnect();
     process.exit(0);
 });
 process.on("SIGTERM", async () => {
     clearInterval(interval);
+    wss.clients.forEach((c) => c.terminate());
+    server.close();
     await prisma.$disconnect();
     process.exit(0);
 });
