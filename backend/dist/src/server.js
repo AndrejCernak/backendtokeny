@@ -36,7 +36,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-// backend/server.ts
+// src/server.ts
 require("dotenv/config");
 const express_1 = __importDefault(require("express"));
 const ws_1 = __importStar(require("ws"));
@@ -67,8 +67,7 @@ app.use((0, cors_1.default)({
             return callback(null, true);
         try {
             const url = new URL(origin);
-            const ok = allowedOrigins.has(origin) ||
-                /\.vercel\.app$/.test(url.hostname); // povolí všetky vercel preview
+            const ok = allowedOrigins.has(origin) || /\.vercel\.app$/.test(url.hostname);
             if (ok)
                 return callback(null, true);
         }
@@ -84,12 +83,10 @@ const server = http_1.default.createServer(app);
 const wss = new ws_1.WebSocketServer({ server });
 // ───────────────────────────────────────────────────────────────────────────────
 // Clerk JWT (pre REST). WS registrácia ostáva kompatibilná s FE (posiela userId + deviceId).
-const ISSUER = process.env.CLERK_ISSUER; // napr. https://your-subdomain.clerk.accounts.dev
+const ISSUER = process.env.CLERK_ISSUER;
 if (!ISSUER)
     console.warn("⚠️  Missing CLERK_ISSUER in env!");
-const JWKS = ISSUER
-    ? (0, jose_1.createRemoteJWKSet)(new URL(`${ISSUER}/.well-known/jwks.json`))
-    : null;
+const JWKS = ISSUER ? (0, jose_1.createRemoteJWKSet)(new URL(`${ISSUER}/.well-known/jwks.json`)) : null;
 async function getUserIdFromAuthHeader(req) {
     try {
         const auth = req.header("authorization") || req.header("Authorization");
@@ -106,7 +103,7 @@ async function getUserIdFromAuthHeader(req) {
         return null;
     }
 }
-// userId -> (deviceId -> WebSocket)
+// userId -> (deviceId -> socket)
 const clients = new Map();
 const PENDING_TTL_MS = 3 * 60 * 1000; // 3 min
 const pendingCalls = new Map(); // kľúč: calleeId (admin)
@@ -251,18 +248,20 @@ app.get("/calls/pending", async (req, res) => {
     }
 });
 // ───────────────────────────────────────────────────────────────────────────────
-// WEBSOCKET
-wss.on("connection", (ws) => {
+// WEBSOCKET – TU JE CELÝ KÓD S ExtendedWS
+wss.on("connection", (raw) => {
+    const ws = raw;
     ws.isAlive = true;
     ws.on("pong", () => (ws.isAlive = true));
     ws.on("message", async (message) => {
         try {
-            const data = JSON.parse(message.toString());
-            const type = data.type;
+            const str = message.toString();
+            const data = JSON.parse(str);
+            const type = typeof data.type === "string" ? data.type : undefined;
             // REGISTER
             if (type === "register") {
-                const userId = data.userId || null;
-                const deviceId = data.deviceId || null;
+                const userId = typeof data.userId === "string" ? data.userId : null;
+                const deviceId = typeof data.deviceId === "string" ? data.deviceId : null;
                 if (!userId || !deviceId)
                     return;
                 ws.userId = userId;
@@ -291,15 +290,15 @@ wss.on("connection", (ws) => {
                 }
                 return;
             }
-            // helpery
+            // pomocné identity
             const currentUserId = ws.userId || null;
             const currentDeviceId = ws.deviceId || null;
             if (!currentUserId || !currentDeviceId)
                 return;
             // CALL REQUEST (client -> admin)
             if (type === "call-request") {
-                const targetId = data.targetId;
-                const callerName = data.callerName || "";
+                const targetId = typeof data.targetId === "string" ? data.targetId : undefined;
+                const callerName = typeof data.callerName === "string" ? data.callerName : "";
                 if (!targetId)
                     return;
                 if ((0, config_1.isFridayInBratislava)()) {
@@ -334,12 +333,7 @@ wss.on("connection", (ws) => {
                 try {
                     await sendPushToAllUserDevices(targetId, {
                         notification: { title: "Prichádzajúci hovor", body: `${callerName} ti volá` },
-                        data: {
-                            type: "incoming_call",
-                            callId,
-                            callerId: currentUserId,
-                            callerName,
-                        },
+                        data: { type: "incoming_call", callId, callerId: currentUserId, callerName },
                     });
                     console.log(`📩 Push sent to ALL devices of ${targetId}`);
                 }
@@ -349,22 +343,17 @@ wss.on("connection", (ws) => {
                 return;
             }
             // SIGNALING (adresne podľa call kontextu)
-            if (["webrtc-offer", "webrtc-answer", "webrtc-candidate", "request-offer"].includes(type)) {
-                const targetId = data.targetId;
-                const callId = data.callId;
+            if (type === "webrtc-offer" || type === "webrtc-answer" || type === "webrtc-candidate" || type === "request-offer") {
+                const targetId = typeof data.targetId === "string" ? data.targetId : undefined;
+                const callId = typeof data.callId === "string" ? data.callId : undefined;
                 if (!targetId)
                     return;
                 let targetDeviceId;
                 if (callId) {
                     let ctx = callCtxById.get(callId);
-                    // ak kontext neexistuje (napr. reštart tabu), skús ho založiť z dostupných dát
+                    // ak kontext neexistuje (napr. reštart tabu), založ ho best-effort
                     if (!ctx) {
-                        // nevieme spoľahlivo odvodiť caller/callee bez ďalších info, ale použijeme best-effort:
-                        ctx = {
-                            callId,
-                            callerId: currentUserId, // dočasné; opraví sa pri ďalších správach
-                            calleeId: targetId,
-                        };
+                        ctx = { callId, callerId: currentUserId, calleeId: targetId };
                         callCtxById.set(callId, ctx);
                     }
                     // zafixuj deviceId od odosielateľa
@@ -373,13 +362,11 @@ wss.on("connection", (ws) => {
                     if (currentUserId === ctx.calleeId)
                         ctx.calleeDeviceId = ctx.calleeDeviceId ?? currentDeviceId;
                     // urč adresný target device
-                    if (targetId === ctx.callerId && ctx.callerDeviceId) {
+                    if (targetId === ctx.callerId && ctx.callerDeviceId)
                         targetDeviceId = ctx.callerDeviceId;
-                    }
-                    if (targetId === ctx.calleeId && ctx.calleeDeviceId) {
+                    if (targetId === ctx.calleeId && ctx.calleeDeviceId)
                         targetDeviceId = ctx.calleeDeviceId;
-                    }
-                    // špeciálne spracovanie ANSWER (lock na admin zariadenie)
+                    // ANSWER → lock na admin zariadenie + billing štart
                     if (type === "webrtc-answer") {
                         // odpovedá admin (calleeId)
                         if (currentUserId === ctx.calleeId) {
@@ -406,10 +393,7 @@ wss.on("connection", (ws) => {
                                         if ((0, config_1.isFridayInBratislava)()) {
                                             const deficit = await (0, db_1.consumeFridaySeconds)(ctx.callerId, 10);
                                             const minutesLeft = await (0, db_1.fridayMinutes)(ctx.callerId);
-                                            sendToUser(ctx.callerId, {
-                                                type: "friday-balance-update",
-                                                minutesRemaining: minutesLeft,
-                                            }, ctx.callerDeviceId);
+                                            sendToUser(ctx.callerId, { type: "friday-balance-update", minutesRemaining: minutesLeft }, ctx.callerDeviceId);
                                             if (deficit > 0 || minutesLeft <= 0) {
                                                 const msg = { type: "end-call", reason: "no-friday-tokens" };
                                                 sendToUser(ctx.callerId, msg, ctx.callerDeviceId);
@@ -454,8 +438,8 @@ wss.on("connection", (ws) => {
             }
             // END-CALL
             if (type === "end-call") {
-                const targetId = data.targetId;
-                const callId = data.callId;
+                const targetId = typeof data.targetId === "string" ? data.targetId : "";
+                const callId = typeof data.callId === "string" ? data.callId : undefined;
                 let targetDeviceId;
                 let selfDeviceId = currentDeviceId;
                 if (callId) {
@@ -532,12 +516,14 @@ wss.on("connection", (ws) => {
         }
     });
     ws.on("error", (e) => {
-        console.error("❌ WS error:", e?.message || e);
+        const err = e;
+        console.error("❌ WS error:", err?.message || e);
     });
 });
 // WS keepalive
 const interval = setInterval(() => {
-    wss.clients.forEach((ws) => {
+    wss.clients.forEach((raw) => {
+        const ws = raw;
         if (ws.isAlive === false)
             return ws.terminate();
         ws.isAlive = false;
