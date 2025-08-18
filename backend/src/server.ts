@@ -363,107 +363,134 @@ wss.on("connection", (raw: WebSocket) => {
       }
 
       // SIGNALING (adresne podľa call kontextu)
-      if (type === "webrtc-offer" || type === "webrtc-answer" || type === "webrtc-candidate" || type === "request-offer") {
-        const targetId = typeof data.targetId === "string" ? (data.targetId as string) : undefined;
-        const callId = typeof data.callId === "string" ? (data.callId as string) : undefined;
-        if (!targetId) return;
+      // SIGNALING (adresne podľa call kontextu)
+if (
+  type === "webrtc-offer" ||
+  type === "webrtc-answer" ||
+  type === "webrtc-candidate" ||
+  type === "request-offer"
+) {
+  const targetId = typeof data.targetId === "string" ? (data.targetId as string) : undefined;
+  let callId = typeof data.callId === "string" ? (data.callId as string) : undefined;
+  if (!targetId) return;
 
-        let targetDeviceId: string | undefined;
-        if (callId) {
-          let ctx = callCtxById.get(callId);
-
-          // ak kontext neexistuje (napr. reštart tabu), založ ho best-effort
-          if (!ctx) {
-            ctx = { callId, callerId: currentUserId, calleeId: targetId };
-            callCtxById.set(callId, ctx);
-          }
-
-          // zafixuj deviceId od odosielateľa
-          if (currentUserId === ctx.callerId) ctx.callerDeviceId = currentDeviceId;
-          if (currentUserId === ctx.calleeId) ctx.calleeDeviceId = ctx.calleeDeviceId ?? currentDeviceId;
-
-          // urč adresný target device
-          if (targetId === ctx.callerId && ctx.callerDeviceId) targetDeviceId = ctx.callerDeviceId;
-          if (targetId === ctx.calleeId && ctx.calleeDeviceId) targetDeviceId = ctx.calleeDeviceId;
-
-          // ANSWER → lock na admin zariadenie + billing štart
-          if (type === "webrtc-answer") {
-            // odpovedá admin (calleeId)
-            if (currentUserId === ctx.calleeId) {
-              ctx.calleeDeviceId = currentDeviceId; // LOCK na toto zariadenie
-              pendingCalls.delete(ctx.calleeId); // už nie je pending
-              // zhasni banner na ostatných admin zariadeniach
-              sendToUserExceptDevice(ctx.calleeId, currentDeviceId, {
-                type: "call-locked",
-                callId,
-                by: ctx.calleeId,
-              });
-            }
-
-            // spusti billing len ak ešte nebeží
-            const key = callKeyFor(ctx.callerId, ctx.calleeId);
-            if (!activeCalls.has(key)) {
-              try {
-                await ensureUser(ctx.callerId);
-                await ensureUser(ctx.calleeId);
-
-                const session = await prisma.callSession.create({
-                  data: { callerId: ctx.callerId, calleeId: ctx.calleeId, status: "active", startedAt: new Date() },
-                });
-
-                const intervalId = setInterval(async () => {
-                  try {
-                    if (isFridayInBratislava()) {
-                      const deficit = await consumeFridaySeconds(ctx.callerId, 10);
-                      const minutesLeft = await fridayMinutes(ctx.callerId);
-
-                      sendToUser(ctx.callerId, { type: "friday-balance-update", minutesRemaining: minutesLeft }, ctx.callerDeviceId);
-
-                      if (deficit > 0 || minutesLeft <= 0) {
-                        const msg = { type: "end-call", reason: "no-friday-tokens" };
-                        sendToUser(ctx.callerId, msg, ctx.callerDeviceId);
-                        sendToUser(ctx.calleeId, msg, ctx.calleeDeviceId);
-
-                        const endedAt = new Date();
-                        const secondsBilled = Math.ceil((endedAt.getTime() - session.startedAt.getTime()) / 1000);
-                        const priceEur = (secondsBilled * PRICE_PER_SECOND).toFixed(2);
-                        await prisma.callSession.update({
-                          where: { id: session.id },
-                          data: { endedAt, status: "no_tokens", secondsBilled, priceEur },
-                        });
-
-                        clearInterval(intervalId);
-                        activeCalls.delete(key);
-                      }
-                    }
-                  } catch (e) {
-                    console.error("decrement/billing interval error:", e);
-                  }
-                }, 10_000);
-
-                activeCalls.set(key, {
-                  callerId: ctx.callerId,
-                  calleeId: ctx.calleeId,
-                  intervalId,
-                  startedAt: session.startedAt,
-                  callSessionId: session.id,
-                });
-
-                // signal pre FE
-                sendToUser(ctx.callerId, { type: "call-started", from: ctx.calleeId, callId }, ctx.callerDeviceId);
-                sendToUser(ctx.calleeId, { type: "call-started", from: ctx.callerId, callId }, ctx.calleeDeviceId);
-              } catch (e) {
-                console.error("callSession start error:", e);
-              }
-            }
-          }
+  // --- 1) Doplň callId, keď chýba (typicky prvý OFFER ide bez callId z FE) ---
+  if (!callId) {
+    // pokus č.1: pendingCalls pre tohto callee (admina)
+    const pending = pendingCalls.get(targetId);
+    if (pending && pending.callerId === currentUserId) {
+      callId = pending.callId;
+    } else {
+      // pokus č.2: nájdi existujúci callCtx podľa dvojice (caller, callee)
+      for (const ctx of callCtxById.values()) {
+        if (
+          (ctx.callerId === currentUserId && ctx.calleeId === targetId) ||
+          (ctx.calleeId === currentUserId && ctx.callerId === targetId)
+        ) {
+          callId = ctx.callId;
+          break;
         }
-
-        // forward signalingu adresne, ak device známy — inak broadcast na usera
-        const forwarded = { ...data, from: currentUserId, targetDeviceId };
-        sendToUser(targetId, forwarded, targetDeviceId);
-        return;
       }
+    }
+  }
+
+  let targetDeviceId: string | undefined;
+  if (callId) {
+    let ctx = callCtxById.get(callId);
+
+    // ak kontext neexistuje (reštart tabu), založ best-effort
+    if (!ctx) {
+      ctx = { callId, callerId: currentUserId, calleeId: targetId };
+      callCtxById.set(callId, ctx);
+    }
+
+    // zafixuj device od odosielateľa do kontextu
+    if (currentUserId === ctx.callerId) ctx.callerDeviceId = currentDeviceId;
+    if (currentUserId === ctx.calleeId) ctx.calleeDeviceId = ctx.calleeDeviceId ?? currentDeviceId;
+
+    // ANSWER → lock na admin zariadenie + billing štart (ponechané ako u teba)
+    if (type === "webrtc-answer") {
+      if (currentUserId === ctx.calleeId) {
+        ctx.calleeDeviceId = currentDeviceId; // LOCK na toto zariadenie
+        pendingCalls.delete(ctx.calleeId);
+        sendToUserExceptDevice(ctx.calleeId, currentDeviceId, {
+          type: "call-locked",
+          callId,
+          by: ctx.calleeId,
+        });
+      }
+
+      const key = callKeyFor(ctx.callerId, ctx.calleeId);
+      if (!activeCalls.has(key)) {
+        try {
+          await ensureUser(ctx.callerId);
+          await ensureUser(ctx.calleeId);
+
+          const session = await prisma.callSession.create({
+            data: { callerId: ctx.callerId, calleeId: ctx.calleeId, status: "active", startedAt: new Date() },
+          });
+
+          const intervalId = setInterval(async () => {
+            try {
+              if (isFridayInBratislava()) {
+                const deficit = await consumeFridaySeconds(ctx.callerId, 10);
+                const minutesLeft = await fridayMinutes(ctx.callerId);
+
+                sendToUser(
+                  ctx.callerId,
+                  { type: "friday-balance-update", minutesRemaining: minutesLeft },
+                  ctx.callerDeviceId
+                );
+
+                if (deficit > 0 || minutesLeft <= 0) {
+                  const msg = { type: "end-call", reason: "no-friday-tokens" };
+                  sendToUser(ctx.callerId, msg, ctx.callerDeviceId);
+                  sendToUser(ctx.calleeId, msg, ctx.calleeDeviceId);
+
+                  const endedAt = new Date();
+                  const secondsBilled = Math.ceil((endedAt.getTime() - session.startedAt.getTime()) / 1000);
+                  const priceEur = (secondsBilled * PRICE_PER_SECOND).toFixed(2);
+                  await prisma.callSession.update({
+                    where: { id: session.id },
+                    data: { endedAt, status: "no_tokens", secondsBilled, priceEur },
+                  });
+
+                  clearInterval(intervalId);
+                  activeCalls.delete(key);
+                }
+              }
+            } catch (e) {
+              console.error("decrement/billing interval error:", e);
+            }
+          }, 10_000);
+
+          activeCalls.set(key, {
+            callerId: ctx.callerId,
+            calleeId: ctx.calleeId,
+            intervalId,
+            startedAt: session.startedAt,
+            callSessionId: session.id,
+          });
+
+          sendToUser(ctx.callerId, { type: "call-started", from: ctx.calleeId, callId }, ctx.callerDeviceId);
+          sendToUser(ctx.calleeId, { type: "call-started", from: ctx.callerId, callId }, ctx.calleeDeviceId);
+        } catch (e) {
+          console.error("callSession start error:", e);
+        }
+      }
+    }
+
+    // adresný target podľa kontextu
+    if (targetId === ctx.callerId && ctx.callerDeviceId) targetDeviceId = ctx.callerDeviceId;
+    if (targetId === ctx.calleeId && ctx.calleeDeviceId) targetDeviceId = ctx.calleeDeviceId;
+  }
+
+  // --- 2) forwarduj a DOPOŠLI aj callId (aby ho FE vždy dostal) ---
+  const forwarded = { ...data, from: currentUserId, targetDeviceId, callId };
+  sendToUser(targetId, forwarded, targetDeviceId);
+  return;
+}
+
 
       // END-CALL
       if (type === "end-call") {
