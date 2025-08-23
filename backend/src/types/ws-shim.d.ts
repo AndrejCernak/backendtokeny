@@ -17,6 +17,8 @@ declare module "ws" {
     binaryType: "nodebuffer" | "arraybuffer";
     // 🔧 keepalive flag, ktorú používaš
     isAlive?: boolean;
+    userId: string;
+    deviceId: string;
 
     send(data: any, cb?: (err?: Error) => void): void;
     close(code?: number, data?: string): void;
