@@ -80,7 +80,7 @@ app.use((0, cors_1.default)({
 }));
 // HTTP + WS server
 const server = http_1.default.createServer(app);
-const wss = new ws_1.WebSocketServer({ server });
+const wss = new ws_1.WebSocketServer({ server }); // path nepoužijem → funguje s ws://host:PORT
 // ───────────────────────────────────────────────────────────────────────────────
 // Clerk JWT (pre REST). WS registrácia ostáva kompatibilná s FE (posiela userId + deviceId).
 const ISSUER = process.env.CLERK_ISSUER;
@@ -248,7 +248,7 @@ app.get("/calls/pending", async (req, res) => {
     }
 });
 // ───────────────────────────────────────────────────────────────────────────────
-// WEBSOCKET – TU JE CELÝ KÓD S ExtendedWS
+// WEBSOCKET
 wss.on("connection", (raw) => {
     const ws = raw;
     ws.isAlive = true;
@@ -294,6 +294,16 @@ wss.on("connection", (raw) => {
             const currentUserId = ws.userId || null;
             const currentDeviceId = ws.deviceId || null;
             if (!currentUserId || !currentDeviceId)
+                return;
+            // PING/PONG z FE
+            if (type === "ping") {
+                try {
+                    ws.send(JSON.stringify({ type: "pong" }));
+                }
+                catch { }
+                return;
+            }
+            if (type === "pong")
                 return;
             // CALL REQUEST (client -> admin)
             if (type === "call-request") {
@@ -343,7 +353,6 @@ wss.on("connection", (raw) => {
                 return;
             }
             // SIGNALING (adresne podľa call kontextu)
-            // SIGNALING (adresne podľa call kontextu)
             if (type === "webrtc-offer" ||
                 type === "webrtc-answer" ||
                 type === "webrtc-candidate" ||
@@ -383,7 +392,7 @@ wss.on("connection", (raw) => {
                         ctx.callerDeviceId = currentDeviceId;
                     if (currentUserId === ctx.calleeId)
                         ctx.calleeDeviceId = ctx.calleeDeviceId ?? currentDeviceId;
-                    // ANSWER → lock na admin zariadenie + billing štart (ponechané ako u teba)
+                    // ANSWER → lock na admin zariadenie + billing štart
                     if (type === "webrtc-answer") {
                         if (currentUserId === ctx.calleeId) {
                             ctx.calleeDeviceId = currentDeviceId; // LOCK na toto zariadenie
@@ -451,7 +460,8 @@ wss.on("connection", (raw) => {
                 }
                 // --- 2) forwarduj a DOPOŠLI aj callId (aby ho FE vždy dostal) ---
                 const forwarded = { ...data, from: currentUserId, targetDeviceId, callId };
-                sendToUser(targetId, forwarded, targetDeviceId);
+                console.log("[FW] type=%s from=%s(dev:%s) -> to=%s dev=%s callId=%s", type, currentUserId, currentDeviceId, data.targetId || "-", targetDeviceId || "(any)", forwarded.callId || "-");
+                sendToUser(data.targetId, forwarded, targetDeviceId);
                 return;
             }
             // END-CALL
