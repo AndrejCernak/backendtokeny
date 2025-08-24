@@ -116,8 +116,13 @@ function callKeyFor(a: string, b: string) {
 }
 
 async function ensureUser(userId: string) {
-  await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+  try {
+    await prisma.user.create({ data: { id: userId } });
+  } catch (e: any) {
+    if (e?.code !== "P2002") throw e; // duplikát ignorujeme
+  }
 }
+
 
 // WS send helpery
 function sendToUser(userId: string, msg: unknown, targetDeviceId?: string) {
@@ -194,15 +199,14 @@ async function sendPushToAllUserDevices(
 // ───────────────────────────────────────────────────────────────────────────────
 // REST ROUTES
 
-// 1) Po prihlásení z FE → upsert usera (kvôli FK)
+
 app.post("/sync-user", async (req, res) => {
-  const userId = await getUserIdFromAuthHeader(req);
+  const userId = await getUserIdFromAuthHeader(req); // overí JWT cez JWKS z CLERK_ISSUER
   if (!userId) return res.status(401).json({ error: "Unauthenticated" });
 
   try {
     await ensureUser(userId);
 
-    // doplň rolu do publicMetadata, ak nie je nastavená
     try {
       const u = await clerk.users.getUser(userId);
       const hasRole = (u.publicMetadata as any)?.role;
@@ -222,6 +226,7 @@ app.post("/sync-user", async (req, res) => {
     return res.status(500).json({ error: "Server error" });
   }
 });
+
 
 
 
