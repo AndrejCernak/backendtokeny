@@ -11,6 +11,7 @@
     "migrate:deploy": "prisma migrate deploy"
   },
   "dependencies": {
+    "@clerk/backend": "^2.9.4",
     "@clerk/express": "^1.7.21",
     "@prisma/client": "^6.14.0",
     "cors": "^2.8.5",

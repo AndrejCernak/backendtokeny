@@ -8,6 +8,10 @@ import admin from "./firebase-admin";
 import { PrismaClient } from "@prisma/client";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { randomUUID } from "crypto";
+import { createClerkClient } from "@clerk/backend";
+
+const clerk = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY! });
+
 
 // ───────────────────────────────────────────────────────────────────────────────
 // Lokálne rozšírenie typu WebSocket (bez .d.ts augmentácie)
@@ -194,14 +198,32 @@ async function sendPushToAllUserDevices(
 app.post("/sync-user", async (req, res) => {
   const userId = await getUserIdFromAuthHeader(req);
   if (!userId) return res.status(401).json({ error: "Unauthenticated" });
+
   try {
     await ensureUser(userId);
+
+    // doplň rolu do publicMetadata, ak nie je nastavená
+    try {
+      const u = await clerk.users.getUser(userId);
+      const hasRole = (u.publicMetadata as any)?.role;
+      if (!hasRole) {
+        await clerk.users.updateUser(userId, {
+          publicMetadata: { ...(u.publicMetadata || {}), role: "client" },
+        });
+        console.log(`🔑 Clerk: nastavil som rolu "client" pre user ${userId}`);
+      }
+    } catch (e) {
+      console.error("clerk update role failed:", e);
+    }
+
     return res.json({ ok: true });
   } catch (e) {
     console.error("sync-user error:", e);
     return res.status(500).json({ error: "Server error" });
   }
 });
+
+
 
 // 2) Registrácia/aktualizácia FCM tokenu
 app.post("/register-fcm", async (req, res) => {

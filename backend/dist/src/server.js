@@ -46,6 +46,8 @@ const firebase_admin_1 = __importDefault(require("./firebase-admin"));
 const client_1 = require("@prisma/client");
 const jose_1 = require("jose");
 const crypto_1 = require("crypto");
+const backend_1 = require("@clerk/backend");
+const clerk = (0, backend_1.createClerkClient)({ secretKey: process.env.CLERK_SECRET_KEY });
 // Friday moduly
 const routes_1 = __importDefault(require("./friday/routes"));
 const config_1 = require("./friday/config");
@@ -191,6 +193,20 @@ app.post("/sync-user", async (req, res) => {
         return res.status(401).json({ error: "Unauthenticated" });
     try {
         await ensureUser(userId);
+        // doplň rolu do publicMetadata, ak nie je nastavená
+        try {
+            const u = await clerk.users.getUser(userId);
+            const hasRole = u.publicMetadata?.role;
+            if (!hasRole) {
+                await clerk.users.updateUser(userId, {
+                    publicMetadata: { ...(u.publicMetadata || {}), role: "client" },
+                });
+                console.log(`🔑 Clerk: nastavil som rolu "client" pre user ${userId}`);
+            }
+        }
+        catch (e) {
+            console.error("clerk update role failed:", e);
+        }
         return res.json({ ok: true });
     }
     catch (e) {
