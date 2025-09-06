@@ -58,7 +58,7 @@ app.use(
 
 // HTTP + WS server
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server }); // path nepoužijem → funguje s ws://host:PORT
+const wss = new WebSocketServer({ server, path: "/ws" });
 
 // ───────────────────────────────────────────────────────────────────────────────
 // Clerk JWT (pre REST). WS registrácia ostáva kompatibilná s FE (posiela userId + deviceId).
